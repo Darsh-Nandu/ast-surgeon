@@ -136,10 +136,11 @@ class TaskPlan:
         return next((t for t in self.subtasks if t.id == task_id), None)
 
     def ready_tasks(self, completed_ids: set[str]) -> list[SubTask]:
-        """Return tasks whose dependencies are all satisfied and status=PENDING."""
+        """Return PENDING tasks whose dependencies are all in completed_ids."""
         return [
             t for t in self.subtasks
             if t.status == SubTaskStatus.PENDING
+            and t.id not in completed_ids
             and all(dep in completed_ids for dep in t.dependencies)
         ]
 

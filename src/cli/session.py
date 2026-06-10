@@ -64,34 +64,20 @@ class ChatSession:
         self._root = project_root
         self._config = config
         self._model = model
-        self._history: list[dict] = []
         self._session_start = time.time()
-        self._modified_files: list[str] = []
 
-        # Tool registry — the agent's hands
+        # Phase 4: wire in the full AgentLoop
+        from src.components.agent.loop import AgentLoop
+        self._agent_loop = AgentLoop.create(
+            project_root=project_root,
+            qdrant_host=config.get("qdrant_host", "localhost"),
+            qdrant_port=config.get("qdrant_port", 6333),
+            embedding_provider=config.get("embedding_provider"),
+        )
+
+        # Keep tool registry for /files slash command
         from src.components.tools.file_tools import ToolRegistry
         self._tools = ToolRegistry(project_root)
-
-        # Vector store + pipeline for retrieval
-        self._store = None
-        self._pipeline = None
-        self._init_retrieval()
-
-    def _init_retrieval(self) -> None:
-        """Initialise vector search (non-fatal if Qdrant not running)."""
-        try:
-            from src.components.vectorstore.qdrant_store import VectorStore
-            from src.components.embeddings.providers import get_provider
-            from src.components.embeddings.pipeline import EmbeddingPipeline
-
-            self._store = VectorStore.connect(
-                host=self._config.get("qdrant_host", "localhost"),
-                port=self._config.get("qdrant_port", 6333),
-            )
-            provider = get_provider(self._config.get("embedding_provider"))
-            self._pipeline = EmbeddingPipeline(provider=provider)
-        except Exception as e:
-            console.print(f"[yellow]Warning:[/] Vector search unavailable ({e})")
 
 
     # REPL
@@ -161,31 +147,20 @@ class ChatSession:
     # Agent turn
 
     def _chat_turn(self, user_message: str) -> None:
-        """Process one user message: retrieve context → call LLM → display response."""
-
-        # 1. Retrieve relevant context from vector store
-        context_chunks = self._retrieve_context(user_message)
-
-        # 2. Build system prompt with tool schemas + retrieved context
-        system_prompt = self._build_system_prompt(context_chunks)
-
-        # 3. Add user message to history
-        self._history.append({"role": "user", "content": user_message})
-
-        # 4. Call LLM (Phase 4 will replace this with the deep agent loop)
+        """Process one user message through the full AgentLoop pipeline."""
         console.print()
-        with console.status("[dim]Agent thinking...[/]", spinner="dots"):
-            response_text = self._get_response(system_prompt)
 
-        # 5. Parse response for tool calls and execute them
-        final_response = self._process_response(response_text)
+        # Show live plan/step updates as the agent works
+        with console.status("[dim]Agent working...[/]", spinner="dots") as status:
+            result = self._agent_loop.run(user_message)
 
-        # 6. Display and record
+        # Render response
         console.print("[bold green]Agent:[/]")
-        console.print(Markdown(final_response))
+        console.print(Markdown(result.response))
         console.print()
 
-        self._history.append({"role": "assistant", "content": final_response})
+        # Show what the agent actually did (files, commands, steps)
+        self._render_agent_actions(result)
 
     def _retrieve_context(self, query: str, top_k: int = 6) -> list:
         """Retrieve relevant code chunks for the query."""
@@ -321,12 +296,14 @@ You have deep knowledge of the codebase through semantic search. You can read fi
     # Display helpers
 
     def _quick_search(self, query: str) -> None:
-        if not self._store or not self._pipeline:
+        store = self._agent_loop._store
+        pipeline = self._agent_loop._pipeline
+        if not store or not pipeline:
             console.print("[yellow]Vector search not available.[/]")
             return
         try:
-            query_vec = self._pipeline.embed_query(query)
-            results = self._store.search(query_vec, top_k=5)
+            query_vec = pipeline.embed_query(query)
+            results = store.search(query_vec, top_k=5)
             if not results:
                 console.print("[dim]No results.[/]")
                 return
@@ -363,6 +340,29 @@ You have deep knowledge of the codebase through semantic search. You can read fi
         for entry in log:
             action = "[green]created[/]" if entry["created"] else "[yellow]updated[/]"
             console.print(f"  {action}  {entry['path']}  [dim]({entry['lines']} lines)[/]")
+
+    def _render_agent_actions(self, result) -> None:
+        """Show a compact summary of what the agent did this turn."""
+        from .session import console  # avoid circular if needed
+        parts = []
+        if result.files_modified:
+            parts.append(f"[dim]📝 {len(result.files_modified)} file(s) modified:[/] " +
+                         ", ".join(f"[cyan]{f}[/]" for f in result.files_modified[:4]))
+        if result.commands_run:
+            parts.append(f"[dim]⚡ Ran:[/] [dim]{result.commands_run[-1][:60]}[/]")
+        if result.total_steps:
+            mode_icon = "⚡" if result.mode.value == "direct" else "🔀"
+            parts.append(
+                f"[dim]{mode_icon} {result.mode.value} · "
+                f"{result.total_steps} step(s) · "
+                f"{result.total_latency_ms:.0f}ms[/]"
+            )
+        if not result.success and result.error:
+            parts.append(f"[red]Error: {result.error[:80]}[/]")
+        for part in parts:
+            console.print(part)
+        if parts:
+            console.print()
 
     def _show_session_summary(self) -> None:
         duration = time.time() - self._session_start

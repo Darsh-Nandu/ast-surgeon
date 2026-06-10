@@ -44,13 +44,12 @@ from .router import ModelRouter
 logger = logging.getLogger(__name__)
 
 
+
 # System prompt for the Planner
 
 PLANNER_SYSTEM = """You are the Planner for Sovereign-Code, a production coding agent.
-
 Your job is to analyse a user's coding task and produce a structured execution plan.
-
-You must respond with ONLY a valid JSON object — no markdown, no explanation, just JSON.
+You must respond with ONLY a valid JSON object - no markdown, no explanation, just JSON.
 
 Schema:
 {

@@ -28,6 +28,7 @@ from .planner import Planner
 from .router import ModelRouter
 from .orchestrator import Orchestrator
 from .session_manager import SessionManager, SessionInfo
+from ..memory.coordinator import MemoryCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,13 @@ class AgentLoop:
         self._indexer = indexer
         self._session = session
         self._session_manager = session_manager
+
+        # Layer 1 + 2 Memory
+        self._memory = MemoryCoordinator(
+            session_dir=session.session_dir,
+            project_root=Path(project_root),
+        )
+        self._memory.bootstrap()
 
         self._planner = Planner(router)
         self._orchestrator = Orchestrator(
@@ -264,16 +272,21 @@ class AgentLoop:
 
         codebase_summary = self._retrieve_summary(query)
 
+        # Layer 2 injection: give Planner episodic memory context
+        episodic_context = self._memory.planner_context()
+
         plan = self._planner.plan(
             query=query,
             codebase_summary=codebase_summary,
             conversation_history=self._session.history,
+            episodic_context=episodic_context,
         )
         logger.info("Plan: %s", plan.summary())
 
         result = self._orchestrator.execute(
             plan=plan,
             conversation_history=self._session.history,
+            memory_coordinator=self._memory,
         )
 
         # ── Update session state ──────────────────────────────────────────────
@@ -287,6 +300,11 @@ class AgentLoop:
         self._session.turn_count += 1
         self._session.files_modified.extend(result.files_modified)
         self._session.commands_run.extend(result.commands_run)
+
+        # Layer 2: record completed turn and persist episodic memory
+        turn_number = self._session.turn_count
+        self._memory.on_turn_complete(turn_number, query, result)
+        self._memory.save()
 
         # ── Persist to disk ───────────────────────────────────────────────────
         self._session_manager.save(self._session)

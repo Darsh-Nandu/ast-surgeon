@@ -101,6 +101,7 @@ class Planner:
         query: str,
         codebase_summary: str = "",
         conversation_history: Optional[list[dict]] = None,
+        episodic_context: str = "",
     ) -> TaskPlan:
         """Produce a TaskPlan for the given query.
 
@@ -109,11 +110,13 @@ class Planner:
             codebase_summary:     Brief summary of relevant codebase context
                                   (from vector search, injected by Orchestrator).
             conversation_history: Prior turns for multi-turn context.
+            episodic_context:     Layer 2 episodic memory block (project facts,
+                                  file registry, failed approaches, turn summaries).
 
         Returns:
             TaskPlan — always returns something valid, even on LLM failure.
         """
-        user_content = self._build_user_prompt(query, codebase_summary)
+        user_content = self._build_user_prompt(query, codebase_summary, episodic_context)
         messages = (conversation_history or []) + [
             {"role": "user", "content": user_content}
         ]
@@ -141,10 +144,12 @@ class Planner:
 
     # Internal
 
-    def _build_user_prompt(self, query: str, codebase_summary: str) -> str:
+    def _build_user_prompt(self, query: str, codebase_summary: str, episodic_context: str = "") -> str:
         prompt = f"User task: {query}"
+        if episodic_context:
+            prompt += f"\n\n{episodic_context}"
         if codebase_summary:
-            prompt += f"\n\nRelevant codebase context:\n{codebase_summary}"
+            prompt += f"\n\nRelevant codebase context (semantic search):\n{codebase_summary}"
         return prompt
 
     def _parse_plan(self, raw: str, original_query: str) -> TaskPlan:

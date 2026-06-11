@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from ..tools.file_tools import ToolRegistry
     from ..vectorstore.qdrant_store import VectorStore
     from ..embeddings.pipeline import EmbeddingPipeline
+    from ..memory.coordinator import MemoryCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,7 @@ class SubAgent:
         conversation_history: Optional[list[dict]] = None,
         depth: int = 0,
         parent_id: Optional[str] = None,
+        memory_coordinator=None,
     ):
         self._subtask = subtask
         self._router = router
@@ -182,6 +184,7 @@ class SubAgent:
         self._conversation_history = conversation_history or []
         self._depth = depth
         self._parent_id = parent_id
+        self._memory_coordinator = memory_coordinator
 
         # Per-agent state
         self._step_history: list[dict] = []     # live ReAct conversation
@@ -189,6 +192,19 @@ class SubAgent:
         self._files_modified: list[str] = []
         self._commands_run: list[str] = []
         self._health = PipelineHealth()
+
+        # Layer 1: Working Memory — created now, discarded after run()
+        if memory_coordinator is not None:
+            self._wm = memory_coordinator.create_working_memory(
+                agent_id=self._agent_id,
+                task_description=subtask.description,
+            )
+        else:
+            from ..memory.working_memory import WorkingMemory
+            self._wm = WorkingMemory(
+                task_description=subtask.description,
+                agent_id=self._agent_id,
+            )
 
         # Stuck-loop detection: rolling window of call fingerprints
         self._recent_calls: deque[str] = deque(maxlen=STUCK_LOOP_WINDOW)
@@ -345,15 +361,28 @@ class SubAgent:
             else:
                 self._health.consecutive_tool_errors = 0
 
-            # Side-effect tracking
+            # Side-effect tracking + Layer 1 Working Memory recording
             if tool_name in ("write_file", "edit_file"):
                 path = tool_args.get("path", "")
                 if path and path not in self._files_modified:
                     self._files_modified.append(path)
+                if path and not tool_error:
+                    content_written = tool_args.get("content", "")
+                    self._wm.record_file_write(path, content_written, operation=tool_name)
+            elif tool_name == "read_file":
+                path = tool_args.get("path", "")
+                if path and not tool_error:
+                    self._wm.record_file_read(path, result_raw or "")
             if tool_name == "run_command":
                 cmd = tool_args.get("command", "")
                 if cmd:
                     self._commands_run.append(cmd)
+                    self._wm.record_command(cmd, result_raw or "", ok=not tool_error)
+            if tool_error:
+                self._wm.record_error(step=step_num, tool=tool_name or "unknown", message=result_raw or "")
+            elif step_num > 1 and self._wm.unresolved_errors:
+                # If last step had an error and this one succeeded, mark it resolved
+                self._wm.mark_error_resolved(step=step_num - 1, resolution=f"{tool_name} succeeded")
 
             # Build trace
             health_flag = (
@@ -399,6 +428,14 @@ class SubAgent:
             self._set_signal(SubAgentSignal.DONE)
 
         self._subtask.health = self._health
+
+        # Layer 1 → Layer 2 harvest: attach files_written and summary to subtask
+        self._subtask.files_written = self._wm.files_written  # type: ignore[attr-defined]
+        self._subtask.working_memory_summary = self._wm.summary()  # type: ignore[attr-defined]
+        if self._memory_coordinator is not None:
+            self._memory_coordinator.on_task_complete(self._subtask, self._wm)
+            self._memory_coordinator.release_working_memory(self._agent_id)
+
         return self._subtask
 
     # ─── Observe (vector context) ─────────────────────────────────────────────
@@ -678,14 +715,22 @@ class SubAgent:
         """
         The ONLY user-authored message in the conversation.
         All subsequent user messages are [TOOL_RESULT] observations.
+
+        Layer 1 injection: working memory context block is prepended here
+        so the LLM always knows what it has already done in this task.
         """
         parts = [f"Task: {self._subtask.description}"]
 
         if self._subtask.context_hint:
             parts.append(f"Context hint: {self._subtask.context_hint}")
 
+        # Layer 1: inject working memory (files already read/written, prior errors)
+        wm_block = self._wm.to_context_block()
+        if wm_block:
+            parts.append(wm_block)
+
         if context:
-            parts.append(f"\n--- Relevant Codebase Context ---\n{context}\n---")
+            parts.append(f"\n--- Relevant Codebase Context (Layer 3: Semantic) ---\n{context}\n---")
 
         parts.append(
             "\nBegin. Think step-by-step, then choose your first tool call."

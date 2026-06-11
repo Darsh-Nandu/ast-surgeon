@@ -57,6 +57,7 @@ class Orchestrator:
         self._pipeline = embed_pipeline
         self._indexer = indexer          # optional live-reindex after writes
         self._synthesiser = Synthesiser(router)
+        self._memory_coordinator = None  # set in execute()
 
     # ─── Public ──────────────────────────────────────────────────────────────
 
@@ -64,9 +65,11 @@ class Orchestrator:
         self,
         plan: TaskPlan,
         conversation_history: Optional[list[dict]] = None,
+        memory_coordinator=None,
     ) -> AgentResult:
         t0 = time.monotonic()
         logger.info("Orchestrator: %s", plan.summary())
+        self._memory_coordinator = memory_coordinator  # passed to SubAgents
 
         if plan.mode == AgentMode.DIRECT:
             all_traces = self._run_direct(plan, conversation_history)
@@ -234,6 +237,7 @@ class Orchestrator:
             vector_store=self._store,
             embed_pipeline=self._pipeline,
             conversation_history=conversation_history,
+            memory_coordinator=self._memory_coordinator,
         )
 
         try:

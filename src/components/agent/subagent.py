@@ -1,43 +1,47 @@
 """
 SubAgent — a proper ReAct (Reason + Act) loop for one subtask.
 
-KEY IMPROVEMENTS over the original:
-  1. TRUE TOOL-CALL / OBSERVE CYCLE
-     Each step: LLM reasons → picks tool → tool runs → result fed back as
-     a structured "tool_result" role message → LLM sees it next step.
-     The LLM is not just appended text — it receives a proper observation.
+DESIGN PRINCIPLES:
+  1. STRICT MESSAGE ALTERNATION
+     Every LLM call sees a history that ends with a user message.
+     After each tool execution the result is injected as a user message
+     so the next LLM call always follows the pattern:
+       user → assistant → user → assistant → ...
+     This is the invariant that makes Groq and Gemini both happy.
 
-  2. SUBAGENT AWAITING SIGNAL
-     When a parent spawns a child, the parent marks its signal as RUNNING
-     and polls child.signal. The parent blocks (in-thread) until the child
-     emits DONE or FAILED, then reads the result. No fire-and-forget.
+  2. TRUE TOOL-CALL / OBSERVE CYCLE
+     Think → Act → Observe is one atomic unit. The observation (tool result
+     or child agent result) is immediately appended to history before the
+     next step so the LLM always reasons from up-to-date state.
 
-  3. PIPELINE HEALTH & SLEEP MODE
-     The agent tracks:
-       - consecutive tool errors
-       - JSON parse failures
-       - repeated identical tool calls (stuck loop)
-     When thresholds are crossed, it sets health.sleep_mode=True and
-     emits a HealthSignal. The Orchestrator reads this and can trigger
-     a future RepairAgent.
+  3. SPAWN-AND-AWAIT WITH PROPER SIGNALLING
+     When spawn_subagent is chosen, the parent signals AWAITING (not just
+     RUNNING), blocks until the child emits DONE/FAILED/SLEEPING, then
+     injects the child's full output as a user observation so the parent
+     can act on it in the very next step.
 
-  4. RICH SYSTEM PROMPT WITH FULL TOOL SCHEMAS
-     Tools are described with complete parameter schemas, not just names.
-     The LLM has enough detail to call tools correctly on first attempt.
+  4. STUCK LOOP DETECTION
+     A rolling window of (tool_name, args_fingerprint) tuples detects
+     when the agent is calling the same thing repeatedly. On detection
+     a health signal is emitted and the agent is nudged to try a
+     different approach before sleep mode is triggered.
 
-  5. STEP HISTORY IS A PROPER CONVERSATION
-     Messages alternate user/assistant and include structured tool results
-     so the LLM always has a coherent conversation to reason from.
+  5. PIPELINE HEALTH & SLEEP MODE
+     Tracks parse failures, consecutive tool errors, LLM errors, and
+     stuck loops. When thresholds are crossed, health.sleep_mode=True
+     and the Orchestrator is notified to invoke a future RepairAgent.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import threading
 import time
 import uuid
+from collections import deque
 from typing import Optional, TYPE_CHECKING
 
 from .models import (
@@ -57,10 +61,10 @@ ABSOLUTE_MAX_STEPS = 20
 
 # ─── Health thresholds ────────────────────────────────────────────────────────
 
-PARSE_FAILURE_SLEEP_THRESHOLD    = 3
+PARSE_FAILURE_SLEEP_THRESHOLD     = 3
 CONSECUTIVE_ERROR_SLEEP_THRESHOLD = 4
-LLM_ERROR_SLEEP_THRESHOLD        = 3
-STUCK_LOOP_WINDOW                = 3    # N identical calls in a row = stuck
+LLM_ERROR_SLEEP_THRESHOLD         = 3
+STUCK_LOOP_WINDOW                 = 3    # N identical calls in a row = stuck loop
 
 # ─── System prompt ────────────────────────────────────────────────────────────
 
@@ -74,12 +78,21 @@ TASK TYPE: {task_type}
 
 {tool_schemas_detailed}
 
+## ReAct Protocol
+
+You operate in a strict Think → Act → Observe loop:
+  1. THINK  — reason step-by-step about what you know and what to do next.
+  2. ACT    — choose exactly one tool to call (or declare done / spawn a child).
+  3. OBSERVE — you will receive the tool result as the next message.
+
+Repeat until the task is fully complete, then set action=done.
+
 ## Response Format
 
-You MUST reply with a single valid JSON object and NOTHING else:
+You MUST reply with a single valid JSON object and NOTHING else (no markdown fences):
 
 {{
-  "thought": "Step-by-step reasoning: what do I know, what do I need, what is the best next action?",
+  "thought": "Step-by-step reasoning: what do I know, what's missing, what is the best next action?",
   "action": "<tool_name> | done | spawn_subagent",
   "args": {{ ...tool arguments exactly matching the schema above... }},
   "final_answer": "Full answer / result summary. REQUIRED when action=done, omit otherwise."
@@ -87,7 +100,7 @@ You MUST reply with a single valid JSON object and NOTHING else:
 
 When action=spawn_subagent, args MUST be:
 {{
-  "description": "Precise description of the sub-task",
+  "description": "Precise self-contained description of the sub-task",
   "task_type": "code_gen|code_edit|debug|test_write|search|explain",
   "context_hint": "keywords for vector retrieval"
 }}
@@ -100,7 +113,8 @@ When action=spawn_subagent, args MUST be:
 4. THINK STEP-BY-STEP — your "thought" must explain your reasoning, not just state the action.
 5. SPAWN SPARINGLY — only spawn a subagent for a genuinely isolated sub-problem.
 6. DONE CORRECTLY — set action=done only when the task is fully complete. Always set final_answer.
-7. STUCK? — if 2 consecutive attempts at the same thing fail, try a completely different approach.
+7. STUCK? — if 2+ consecutive attempts at the same thing fail, try a completely different approach.
+8. OBSERVE — after every tool call you will see a [TOOL_RESULT] message. Read it carefully before acting.
 """
 
 
@@ -120,24 +134,31 @@ def _format_tool_schemas(schemas: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _args_fingerprint(tool_name: str, args: dict) -> str:
+    """Stable fingerprint of a (tool_name, args) pair for stuck-loop detection."""
+    args_str = json.dumps(args, sort_keys=True, default=str)
+    digest = hashlib.md5(args_str.encode()).hexdigest()[:8]
+    return f"{tool_name}:{digest}"
+
+
 # ─── SubAgent ─────────────────────────────────────────────────────────────────
 
 class SubAgent:
     """
     Runs a true ReAct loop for one SubTask.
 
-    The loop structure per step:
-      1. OBSERVE  — vector-retrieve fresh context
-      2. THINK    — LLM sees full conversation history + retrieved context
-      3. ACT      — execute the chosen tool
-      4. OBSERVE RESULT — tool result is appended as a structured message
-      5. CHECK HEALTH — detect stuck/error conditions, enter sleep if needed
-      6. CHECK DONE — exit if LLM said done or max_steps hit
+    Conversation history invariant:
+      Before every LLM call, the last message in _step_history is ALWAYS
+      a user message. This guarantees strict user/assistant alternation.
 
-    Child SubAgents:
-      When spawn_subagent is chosen, the parent creates a child SubAgent,
-      waits for it to complete (polls child.signal with a timeout), then
-      injects the child's result as a tool_result message and continues.
+    History structure:
+      [user: initial task + context]
+      [assistant: action_1]
+      [user: TOOL_RESULT from action_1]
+      [assistant: action_2]
+      [user: TOOL_RESULT from action_2]
+      ...
+      [assistant: done + final_answer]
     """
 
     def __init__(
@@ -149,7 +170,7 @@ class SubAgent:
         embed_pipeline: Optional["EmbeddingPipeline"] = None,
         agent_id: Optional[str] = None,
         conversation_history: Optional[list[dict]] = None,
-        depth: int = 0,             # nesting depth (0 = top-level subagent)
+        depth: int = 0,
         parent_id: Optional[str] = None,
     ):
         self._subtask = subtask
@@ -163,11 +184,14 @@ class SubAgent:
         self._parent_id = parent_id
 
         # Per-agent state
-        self._step_history: list[dict] = []     # the live ReAct conversation
+        self._step_history: list[dict] = []     # live ReAct conversation
         self._traces: list[StepTrace] = []
         self._files_modified: list[str] = []
         self._commands_run: list[str] = []
         self._health = PipelineHealth()
+
+        # Stuck-loop detection: rolling window of call fingerprints
+        self._recent_calls: deque[str] = deque(maxlen=STUCK_LOOP_WINDOW)
 
         # Threading signal so a parent can poll this agent's state
         self._signal_lock = threading.Lock()
@@ -176,134 +200,139 @@ class SubAgent:
     # ─── Public ──────────────────────────────────────────────────────────────
 
     def run(self) -> SubTask:
-        """Execute the subtask loop. Returns the mutated SubTask with results."""
+        """
+        Execute the ReAct loop.
+
+        Conversation invariant is maintained here in run():
+          1. We inject the initial task message (user) once.
+          2. Each iteration: LLM call (always sees user-last history) →
+             assistant response appended → tool executed → observation
+             injected as user message → repeat.
+          3. On done: assistant response is already appended; we just break.
+
+        Returns the mutated SubTask with results.
+        """
         self._set_signal(SubAgentSignal.RUNNING)
         self._subtask.status = SubTaskStatus.RUNNING
         self._subtask.agent_id = self._agent_id
 
-        logger.info(
-            "[%s] Starting (depth=%d): %s (max_steps=%d)",
-            self._agent_id, self._depth, self._subtask.description[:70],
-            self._subtask.max_steps,
-        )
-
         max_steps = min(self._subtask.max_steps, ABSOLUTE_MAX_STEPS)
 
+        logger.info(
+            "[%s] Starting (depth=%d): %s (max_steps=%d)",
+            self._agent_id, self._depth,
+            self._subtask.description[:70], max_steps,
+        )
+
+        # ── Inject initial task message (user) ───────────────────────────────
+        # This is the only place we build a "user prompt" besides observations.
+        # Subsequent steps consume the [TOOL_RESULT] observations as user msgs.
+        context = self._observe()
+        initial_msg = self._build_initial_message(context)
+        self._step_history.append({"role": "user", "content": initial_msg})
+
+        # ── ReAct loop ───────────────────────────────────────────────────────
         for step_num in range(1, max_steps + 1):
 
-            # ── Health gate: enter sleep before executing step ────────────────
+            # Health gate — enter sleep before any new LLM call
             should_sleep, reason = self._health.should_sleep()
             if should_sleep:
                 self._enter_sleep(reason)
                 break
 
-            trace = self._step(step_num)
-            self._traces.append(trace)
-            self._subtask.traces.append(trace)
+            # ── THINK: call LLM (history ends with user message) ─────────────
+            t0 = time.monotonic()
+            system_prompt = self._build_system_prompt()
+            llm_response = self._router.call(
+                task_type=self._subtask.task_type,
+                system_prompt=system_prompt,
+                messages=self._step_history,
+            )
+            latency = (time.monotonic() - t0) * 1000
 
-            # ── Done? ────────────────────────────────────────────────────────
-            if trace.tool_name is None and not trace.tool_error:
+            # Handle LLM errors
+            if llm_response.is_error:
+                trace = self._handle_llm_error(step_num, llm_response, latency)
+                self._traces.append(trace)
+                self._subtask.traces.append(trace)
+                continue
+
+            # Append assistant response — history now ends with assistant msg
+            self._step_history.append({
+                "role": "assistant",
+                "content": llm_response.content,
+            })
+
+            # ── Parse action ─────────────────────────────────────────────────
+            action, parse_ok = self._parse_action(llm_response.content)
+            if not parse_ok:
+                self._health.parse_failures += 1
+                self._health.record(HealthSignal(
+                    agent_id=self._agent_id,
+                    signal=SleepReason.LLM_PARSE_FAILURES,
+                    detail=f"step {step_num}: {llm_response.content[:120]}",
+                    severity=1,
+                ))
+
+            action_type = action.get("action", "done")
+
+            # ── DONE? ─────────────────────────────────────────────────────────
+            if action_type == "done":
+                # History ends with assistant msg here — correct terminal state
+                trace = StepTrace(
+                    step_number=step_num,
+                    agent_id=self._agent_id,
+                    task_type=self._subtask.task_type,
+                    model_used=llm_response.model_used,
+                    thought=action.get("thought", ""),
+                    tool_name=None,
+                    tool_args={},
+                    tool_result=action.get("final_answer", ""),
+                    tool_result_raw=action.get("final_answer", ""),
+                    tool_error=False,
+                    latency_ms=latency,
+                    health_flag=False,
+                )
+                self._traces.append(trace)
+                self._subtask.traces.append(trace)
+
                 self._subtask.status = SubTaskStatus.DONE
-                self._subtask.result = self._extract_final_answer(trace)
+                self._subtask.result = action.get("final_answer") or self._best_effort_result()
                 self._set_signal(SubAgentSignal.DONE)
                 logger.info("[%s] Done at step %d", self._agent_id, step_num)
                 break
 
-        else:
-            # Hit max_steps — treat as done with best-effort result
-            logger.warning("[%s] Hit max_steps=%d", self._agent_id, max_steps)
-            self._subtask.status = SubTaskStatus.DONE
-            self._subtask.result = self._best_effort_result()
-            self._set_signal(SubAgentSignal.DONE)
+            # ── ACT: execute tool ─────────────────────────────────────────────
+            tool_name, tool_args, result_raw, tool_error = self._act(action)
 
-        self._subtask.health = self._health
-        return self._subtask
+            # Stuck-loop detection (only for real tools, not done/spawn)
+            if action_type not in ("done", "spawn_subagent"):
+                fp = _args_fingerprint(tool_name or action_type, tool_args)
+                self._recent_calls.append(fp)
+                if (
+                    len(self._recent_calls) == STUCK_LOOP_WINDOW
+                    and len(set(self._recent_calls)) == 1
+                ):
+                    logger.warning(
+                        "[%s] ⚠ Stuck loop detected — same call %d times: %s",
+                        self._agent_id, STUCK_LOOP_WINDOW, fp,
+                    )
+                    self._health.record(HealthSignal(
+                        agent_id=self._agent_id,
+                        signal=SleepReason.TOOL_LOOP_DETECTED,
+                        detail=f"Repeated {STUCK_LOOP_WINDOW}x: {fp}",
+                        severity=2,
+                    ))
+                    # Nudge the LLM to try something different
+                    result_raw = (
+                        f"{result_raw or ''}\n\n"
+                        f"⚠ SYSTEM NOTICE: You have called '{tool_name}' with identical "
+                        f"arguments {STUCK_LOOP_WINDOW} times in a row. "
+                        f"This is a stuck loop. You MUST try a completely different approach."
+                    )
+                    self._recent_calls.clear()
 
-    # ─── Core ReAct step ─────────────────────────────────────────────────────
-
-    def _step(self, step_num: int) -> StepTrace:
-        """One full Observe → Think → Act → Observe-Result cycle."""
-        t0 = time.monotonic()
-
-        # 1. OBSERVE — fresh vector context for current task state
-        context = self._observe()
-
-        # 2. THINK — build step message and call LLM
-        step_msg = self._build_step_message(step_num, context)
-        self._step_history.append({"role": "user", "content": step_msg})
-
-        system_prompt = self._build_system_prompt()
-        llm_response = self._router.call(
-            task_type=self._subtask.task_type,
-            system_prompt=system_prompt,
-            messages=self._step_history,
-        )
-
-        if llm_response.is_error:
-            self._health.total_llm_errors += 1
-            self._health.record(HealthSignal(
-                agent_id=self._agent_id,
-                signal=SleepReason.LLM_ERROR_RATE,
-                detail=f"step {step_num}: {llm_response.content[:120]}",
-                severity=2,
-            ))
-            # Record the failed response so history stays coherent
-            self._step_history.append({
-                "role": "assistant",
-                "content": json.dumps({
-                    "thought": "LLM call failed",
-                    "action": "done",
-                    "args": {},
-                    "final_answer": f"[LLM error at step {step_num}]",
-                })
-            })
-            latency = (time.monotonic() - t0) * 1000
-            return StepTrace(
-                step_number=step_num,
-                agent_id=self._agent_id,
-                task_type=self._subtask.task_type,
-                model_used=llm_response.model_used,
-                thought="[LLM error]",
-                tool_name=None,
-                tool_args={},
-                tool_result=llm_response.content,
-                tool_result_raw=llm_response.content,
-                tool_error=True,
-                latency_ms=latency,
-                health_flag=True,
-            )
-
-        # Record assistant turn
-        self._step_history.append({
-            "role": "assistant",
-            "content": llm_response.content,
-        })
-
-        # 3. PARSE
-        action, parse_ok = self._parse_action(llm_response.content)
-        if not parse_ok:
-            self._health.parse_failures += 1
-            self._health.record(HealthSignal(
-                agent_id=self._agent_id,
-                signal=SleepReason.LLM_PARSE_FAILURES,
-                detail=f"step {step_num}: {llm_response.content[:120]}",
-                severity=1,
-            ))
-
-        # 4. ACT
-        tool_name, tool_args, tool_result_raw, tool_error = self._act(action)
-
-        # 5. OBSERVE RESULT — inject tool result as structured user message
-        if tool_name and action.get("action") not in ("done", "spawn_subagent"):
-            status_prefix = "ERROR" if tool_error else "OK"
-            obs_message = (
-                f"[TOOL_RESULT: {tool_name}]\n"
-                f"Status: {status_prefix}\n"
-                f"{tool_result_raw or '(no output)'}"
-            )
-            self._step_history.append({"role": "user", "content": obs_message})
-
-            # Track error streak
+            # Track consecutive errors / resets
             if tool_error:
                 self._health.consecutive_tool_errors += 1
                 if self._health.consecutive_tool_errors >= CONSECUTIVE_ERROR_SLEEP_THRESHOLD:
@@ -314,48 +343,76 @@ class SubAgent:
                         severity=3,
                     ))
             else:
-                self._health.consecutive_tool_errors = 0  # reset on success
+                self._health.consecutive_tool_errors = 0
 
-        latency = (time.monotonic() - t0) * 1000
-        health_flag = (
-            self._health.parse_failures > 0
-            or self._health.consecutive_tool_errors >= 2
-            or tool_error
-        )
+            # Side-effect tracking
+            if tool_name in ("write_file", "edit_file"):
+                path = tool_args.get("path", "")
+                if path and path not in self._files_modified:
+                    self._files_modified.append(path)
+            if tool_name == "run_command":
+                cmd = tool_args.get("command", "")
+                if cmd:
+                    self._commands_run.append(cmd)
 
-        return StepTrace(
-            step_number=step_num,
-            agent_id=self._agent_id,
-            task_type=self._subtask.task_type,
-            model_used=llm_response.model_used,
-            thought=action.get("thought", ""),
-            tool_name=tool_name,
-            tool_args=tool_args,
-            tool_result=(tool_result_raw or "")[:500],
-            tool_result_raw=tool_result_raw,
-            tool_error=tool_error,
-            latency_ms=latency,
-            health_flag=health_flag,
-        )
+            # Build trace
+            health_flag = (
+                self._health.parse_failures > 0
+                or self._health.consecutive_tool_errors >= 2
+                or tool_error
+            )
+            trace = StepTrace(
+                step_number=step_num,
+                agent_id=self._agent_id,
+                task_type=self._subtask.task_type,
+                model_used=llm_response.model_used,
+                thought=action.get("thought", ""),
+                tool_name=tool_name,
+                tool_args=tool_args,
+                tool_result=(result_raw or "")[:500],
+                tool_result_raw=result_raw,
+                tool_error=tool_error,
+                latency_ms=latency,
+                health_flag=health_flag,
+            )
+            self._traces.append(trace)
+            self._subtask.traces.append(trace)
 
-    # ─── Observe ─────────────────────────────────────────────────────────────
+            # ── OBSERVE: inject result as user message ────────────────────────
+            # This restores the invariant: history ends with user message.
+            # The LLM will see this as the "observation" for its next think step.
+            observation = self._build_observation(
+                step_num=step_num,
+                max_steps=max_steps,
+                action_type=action_type,
+                tool_name=tool_name,
+                result_raw=result_raw,
+                tool_error=tool_error,
+            )
+            self._step_history.append({"role": "user", "content": observation})
+
+        else:
+            # Exhausted max_steps
+            logger.warning("[%s] Hit max_steps=%d", self._agent_id, max_steps)
+            self._subtask.status = SubTaskStatus.DONE
+            self._subtask.result = self._best_effort_result()
+            self._set_signal(SubAgentSignal.DONE)
+
+        self._subtask.health = self._health
+        return self._subtask
+
+    # ─── Observe (vector context) ─────────────────────────────────────────────
 
     def _observe(self) -> str:
-        """Retrieve relevant context from the vector store for current task state."""
+        """Retrieve relevant context from the vector store."""
         if not self._store or not self._pipeline:
             return ""
 
         query_parts = [self._subtask.description]
         if self._subtask.context_hint:
             query_parts.append(self._subtask.context_hint)
-        # Fold in the last tool result as a relevance signal
-        for msg in reversed(self._step_history[-4:]):
-            if msg["role"] == "user" and msg["content"].startswith("[TOOL_RESULT"):
-                lines = msg["content"].splitlines()
-                query_parts.append(" ".join(lines[2:5]))
-                break
-
         query = " ".join(query_parts)[:300]
+
         try:
             query_vec = self._pipeline.embed_query(query)
             results = self._store.search(query_vec, top_k=5)
@@ -373,7 +430,7 @@ class SubAgent:
             logger.debug("Observe failed: %s", exc)
             return ""
 
-    # ─── Act ─────────────────────────────────────────────────────────────────
+    # ─── Act ──────────────────────────────────────────────────────────────────
 
     def _act(
         self, action: dict
@@ -400,36 +457,24 @@ class SubAgent:
             return action_type, args, error_msg, True
 
         tool_result = self._tools.run(action_type, **args)
-
-        if action_type in ("write_file", "edit_file"):
-            path = args.get("path", "")
-            if path and path not in self._files_modified:
-                self._files_modified.append(path)
-        if action_type == "run_command":
-            cmd = args.get("command", "")
-            if cmd:
-                self._commands_run.append(cmd)
-
         return action_type, args, tool_result.content, tool_result.is_error
 
     def _spawn_and_await_child(self, args: dict) -> str:
         """
         Spawn a child SubAgent and WAIT for it to finish.
 
-        The parent SubAgent is paused (blocks in this method) until the child
-        emits DONE or FAILED on its signal. This guarantees the parent sees
-        the child's output before continuing its own loop.
-
-        DESIGN: child runs in the same thread (no new thread). The parent
-        literally cannot continue until the child returns. This is intentional
-        for child spawns mid-loop; top-level parallelism is the Orchestrator's job.
+        The parent signals AWAITING so the Orchestrator knows it is not
+        stalled but deliberately blocked on child output. The parent
+        blocks synchronously (same thread) — no new thread — until the
+        child returns. This guarantees the parent's next ReAct step
+        always sees the child's complete output.
         """
         from .models import SubTask, TaskType
 
         description = args.get("description", "(no description)")
         logger.info(
             "[%s] Spawning child subagent: %s",
-            self._agent_id, description[:60]
+            self._agent_id, description[:60],
         )
 
         try:
@@ -458,24 +503,26 @@ class SubAgent:
             parent_id=self._agent_id,
         )
 
-        # ── Parent sets its own signal to RUNNING (in case it was checked) ──
-        self._set_signal(SubAgentSignal.RUNNING)
-
-        # ── Run child synchronously — parent WAITS here ──────────────────────
+        # Signal: parent is now AWAITING a child — not stalled, not done
+        self._set_signal(SubAgentSignal.AWAITING)
         logger.info(
-            "[%s] Waiting for child %s ...",
-            self._agent_id, child_agent._agent_id
+            "[%s] → AWAITING child %s …",
+            self._agent_id, child_agent._agent_id,
         )
+
+        # ── Run child synchronously — parent blocks here ──────────────────
         completed_child_task = child_agent.run()
 
-        # ── Child is done: check signal ──────────────────────────────────────
         child_signal = completed_child_task.signal
         logger.info(
-            "[%s] Child %s finished with signal=%s",
-            self._agent_id, child_agent._agent_id, child_signal.value
+            "[%s] ← Child %s finished: signal=%s",
+            self._agent_id, child_agent._agent_id, child_signal.value,
         )
 
-        # Merge child traces and side effects into parent
+        # Resume running
+        self._set_signal(SubAgentSignal.RUNNING)
+
+        # Merge child traces and side effects
         self._traces.extend(completed_child_task.traces)
         self._files_modified.extend(child_agent._files_modified)
         self._commands_run.extend(child_agent._commands_run)
@@ -484,7 +531,6 @@ class SubAgent:
         for signal in completed_child_task.health.signals:
             self._health.signals.append(signal)
 
-        # If child entered sleep, flag it in parent health too
         if completed_child_task.health.sleep_mode:
             self._health.record(HealthSignal(
                 agent_id=self._agent_id,
@@ -493,7 +539,7 @@ class SubAgent:
                 severity=2,
             ))
 
-        if child_signal == SubAgentSignal.FAILED or child_signal == SubAgentSignal.SLEEPING:
+        if child_signal in (SubAgentSignal.FAILED, SubAgentSignal.SLEEPING):
             return (
                 f"[CHILD AGENT SIGNAL: {child_signal.value}]\n"
                 f"Child task: {description}\n"
@@ -506,7 +552,51 @@ class SubAgent:
             f"Result:\n{completed_child_task.result or '(child completed with no output)'}"
         )
 
-    # ─── Sleep mode ──────────────────────────────────────────────────────────
+    # ─── Observation builder ──────────────────────────────────────────────────
+
+    def _build_observation(
+        self,
+        step_num: int,
+        max_steps: int,
+        action_type: str,
+        tool_name: Optional[str],
+        result_raw: Optional[str],
+        tool_error: bool,
+    ) -> str:
+        """
+        Build the user-role observation message that follows a tool call.
+
+        This message restores the conversation invariant (ends with user msg)
+        and gives the LLM everything it needs for the next think step.
+        """
+        steps_left = max_steps - step_num
+
+        if action_type == "spawn_subagent":
+            header = f"[CHILD_AGENT_RESULT | step {step_num}/{max_steps} | {steps_left} steps left]"
+            body = result_raw or "(no output from child agent)"
+        else:
+            status = "❌ ERROR" if tool_error else "✅ OK"
+            header = (
+                f"[TOOL_RESULT: {tool_name} | {status} | "
+                f"step {step_num}/{max_steps} | {steps_left} steps left]"
+            )
+            body = result_raw or "(no output)"
+
+        # Optionally add a fresh context snippet for long tasks
+        # (only on even steps to avoid noise)
+        context_note = ""
+        if step_num % 4 == 0 and steps_left > 1:
+            fresh_ctx = self._observe()
+            if fresh_ctx:
+                context_note = f"\n\n--- Refreshed Codebase Context ---\n{fresh_ctx}\n---"
+
+        footer = "\nContinue: analyse the result above and decide your next action."
+        if steps_left <= 2:
+            footer = f"\n⚠ Only {steps_left} step(s) remaining — work towards action=done soon."
+
+        return f"{header}\n\n{body}{context_note}{footer}"
+
+    # ─── Sleep mode ───────────────────────────────────────────────────────────
 
     def _enter_sleep(self, reason: SleepReason) -> None:
         """Enter sleep mode — record state, set signals, log clearly."""
@@ -518,7 +608,7 @@ class SubAgent:
 
         logger.warning(
             "[%s] ⚠ ENTERING SLEEP MODE — reason=%s | signals=%d",
-            self._agent_id, reason.value, len(self._health.signals)
+            self._agent_id, reason.value, len(self._health.signals),
         )
         logger.warning(
             "[%s] Health snapshot: parse_failures=%d, consecutive_errors=%d, llm_errors=%d",
@@ -528,7 +618,52 @@ class SubAgent:
             self._health.total_llm_errors,
         )
 
-    # ─── Prompt building ─────────────────────────────────────────────────────
+    # ─── LLM error handling ───────────────────────────────────────────────────
+
+    def _handle_llm_error(
+        self,
+        step_num: int,
+        llm_response,
+        latency: float,
+    ) -> StepTrace:
+        """Handle a failed LLM call: update health, inject recovery observation."""
+        self._health.total_llm_errors += 1
+        self._health.record(HealthSignal(
+            agent_id=self._agent_id,
+            signal=SleepReason.LLM_ERROR_RATE,
+            detail=f"step {step_num}: {llm_response.content[:120]}",
+            severity=2,
+        ))
+
+        # Inject recovery message so history stays coherent (ends with user msg)
+        # The existing last message was already user (initial or previous obs),
+        # but if we somehow got an assistant turn in, add a nudge.
+        if self._step_history and self._step_history[-1]["role"] == "assistant":
+            self._step_history.append({
+                "role": "user",
+                "content": (
+                    f"[SYSTEM: LLM error at step {step_num}. "
+                    f"Error: {llm_response.content[:200]}. "
+                    f"Please continue with your task.]"
+                ),
+            })
+
+        return StepTrace(
+            step_number=step_num,
+            agent_id=self._agent_id,
+            task_type=self._subtask.task_type,
+            model_used=llm_response.model_used,
+            thought="[LLM error]",
+            tool_name=None,
+            tool_args={},
+            tool_result=llm_response.content,
+            tool_result_raw=llm_response.content,
+            tool_error=True,
+            latency_ms=latency,
+            health_flag=True,
+        )
+
+    # ─── Prompt building ──────────────────────────────────────────────────────
 
     def _build_system_prompt(self) -> str:
         detailed_schemas = _format_tool_schemas(self._tools.schemas())
@@ -539,30 +674,25 @@ class SubAgent:
             tool_schemas_detailed=detailed_schemas,
         )
 
-    def _build_step_message(self, step_num: int, context: str) -> str:
-        parts = []
-        max_steps = min(self._subtask.max_steps, ABSOLUTE_MAX_STEPS)
-        parts.append(f"[Step {step_num}/{max_steps}]")
+    def _build_initial_message(self, context: str) -> str:
+        """
+        The ONLY user-authored message in the conversation.
+        All subsequent user messages are [TOOL_RESULT] observations.
+        """
+        parts = [f"Task: {self._subtask.description}"]
+
+        if self._subtask.context_hint:
+            parts.append(f"Context hint: {self._subtask.context_hint}")
 
         if context:
-            parts.append(f"\n--- Retrieved Codebase Context ---\n{context}\n---")
+            parts.append(f"\n--- Relevant Codebase Context ---\n{context}\n---")
 
-        if step_num == 1:
-            parts.append(
-                f"\nBegin working on your task:\n{self._subtask.description}"
-            )
-            if self._subtask.context_hint:
-                parts.append(f"Hint: {self._subtask.context_hint}")
-        else:
-            # Remind agent of task without repeating full context each step
-            parts.append(
-                f"\nTask reminder: {self._subtask.description[:120]}\n"
-                f"Continue. Analyse the tool result above and decide your next action."
-            )
-
+        parts.append(
+            "\nBegin. Think step-by-step, then choose your first tool call."
+        )
         return "\n".join(parts)
 
-    # ─── Helpers ─────────────────────────────────────────────────────────────
+    # ─── Helpers ──────────────────────────────────────────────────────────────
 
     def _parse_action(self, raw: str) -> tuple[dict, bool]:
         """Parse LLM JSON. Returns (action_dict, parse_ok)."""
@@ -570,7 +700,6 @@ class SubAgent:
         try:
             return json.loads(cleaned), True
         except json.JSONDecodeError:
-            # Try to extract the outermost JSON object
             match = re.search(r"\{.*\}", cleaned, re.DOTALL)
             if match:
                 try:
@@ -579,7 +708,7 @@ class SubAgent:
                     pass
 
         logger.warning(
-            "[%s] ⚠ JSON parse failed: %s...", self._agent_id, raw[:120]
+            "[%s] ⚠ JSON parse failed: %s…", self._agent_id, raw[:120]
         )
         return {
             "thought": "Could not parse structured response from LLM",
@@ -587,15 +716,6 @@ class SubAgent:
             "args": {},
             "final_answer": raw,
         }, False
-
-    def _extract_final_answer(self, trace: StepTrace) -> str:
-        """Pull final_answer from the last assistant message in history."""
-        for msg in reversed(self._step_history):
-            if msg["role"] == "assistant":
-                action, _ = self._parse_action(msg["content"])
-                if fa := action.get("final_answer"):
-                    return fa
-        return self._best_effort_result()
 
     def _best_effort_result(self) -> str:
         for trace in reversed(self._traces):
@@ -607,7 +727,7 @@ class SubAgent:
         with self._signal_lock:
             self._subtask.signal = signal
 
-    # ─── Properties ──────────────────────────────────────────────────────────
+    # ─── Properties ───────────────────────────────────────────────────────────
 
     @property
     def traces(self) -> list[StepTrace]:

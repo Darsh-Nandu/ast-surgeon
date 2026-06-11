@@ -101,6 +101,7 @@ class SubAgentSignal(str, Enum):
     """Status signal a child SubAgent sends back to its parent."""
     PENDING   = "pending"   # not yet started
     RUNNING   = "running"   # in progress
+    AWAITING  = "awaiting"  # blocked, waiting for a child subagent to complete
     DONE      = "done"      # completed successfully
     FAILED    = "failed"    # completed with error
     SLEEPING  = "sleeping"  # entered sleep mode, needs intervention

@@ -136,12 +136,24 @@ class Orchestrator:
     ) -> list[StepTrace]:
         all_traces: list[StepTrace] = []
         completed: set[str] = set()
+        pipeline_sleeping = False  # set True if any subtask enters sleep
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             while not plan.is_complete():
                 ready = plan.ready_tasks(completed)
                 if not ready:
                     break
+
+                # If a previous wave entered sleep, skip remaining work
+                if pipeline_sleeping:
+                    logger.warning(
+                        "Orchestrator: skipping %d ready tasks — pipeline in sleep mode",
+                        len(ready),
+                    )
+                    for subtask in ready:
+                        subtask.status = SubTaskStatus.SKIPPED
+                        completed.add(subtask.id)
+                    continue
 
                 futures: dict[Future, SubTask] = {}
                 for subtask in ready:
@@ -150,12 +162,16 @@ class Orchestrator:
                             self._run_one_task, subtask, conversation_history
                         )
                         futures[future] = subtask
-                        logger.info("Submitted subagent for: %s", subtask.id)
+                        logger.info(
+                            "Orchestrator: submitted subagent for subtask=%s", subtask.id
+                        )
                     else:
-                        # Simple tasks run inline
+                        # Simple tasks run inline in the orchestrator thread
                         traces = self._run_one_task(subtask, conversation_history)
                         all_traces.extend(traces)
                         self._handle_post_task(plan, subtask, completed)
+                        if subtask.signal == SubAgentSignal.SLEEPING:
+                            pipeline_sleeping = True
 
                 for future in as_completed(futures, timeout=SUBTASK_TIMEOUT):
                     subtask = futures[future]
@@ -168,6 +184,15 @@ class Orchestrator:
                         subtask.error = str(exc)
 
                     self._handle_post_task(plan, subtask, completed)
+
+                    # Check if this completion triggered sleep
+                    if subtask.signal == SubAgentSignal.SLEEPING:
+                        pipeline_sleeping = True
+                        logger.warning(
+                            "Orchestrator: subtask %s is SLEEPING — "
+                            "remaining futures will complete but no new waves start.",
+                            subtask.id,
+                        )
 
         return all_traces
 

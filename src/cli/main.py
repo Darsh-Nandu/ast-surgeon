@@ -1,5 +1,5 @@
 """
-CLI entry point — `sovereign` command.
+CLI entry point - `sovereign` command.
 
 Commands:
   sovereign init    Index the current project, start the file watcher daemon
@@ -14,7 +14,7 @@ WHY Typer over argparse/click:
 
 DESIGN NOTE on config resolution:
   All commands look for a .sovereign/config.json in the current working
-  directory (or any parent). This is the same pattern as git — you can run
+  directory (or any parent). This is the same pattern as git - you can run
   `sovereign chat` from any subdirectory and it finds the project root.
 """
 
@@ -41,7 +41,7 @@ from rich import print as rprint
 
 app = typer.Typer(
     name="sovereign",
-    help="Sovereign-Code — production-grade coding agent",
+    help="Sovereign-Code - production-grade coding agent",
     add_completion=False,
 )
 console = Console()
@@ -113,7 +113,7 @@ def init(
         raise typer.Exit(1)
 
     console.print(Panel(
-        f"[bold cyan]Sovereign-Code[/] — Initialising project\n"
+        f"[bold cyan]Sovereign-Code[/] - Initialising project\n"
         f"[dim]Root:[/] {project_root}",
         border_style="cyan",
     ))
@@ -343,6 +343,103 @@ def _start_watcher(indexer, project_root: Path) -> None:
 
 
 # Entry point
+
+@app.command()
+def serve(
+    path: str = typer.Argument(".", help="Project directory"),
+    host: str = typer.Option("0.0.0.0", "--host"),
+    port: int = typer.Option(8000, "--port"),
+    reload: bool = typer.Option(False, "--reload"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Start the Sovereign-Code API server with SSE streaming.
+
+    Exposes /chat (SSE), /search, /status, /index, /health endpoints.
+    """
+    _setup_logging(verbose)
+    project_root = _find_project_root(Path(path))
+    config = _load_config(project_root)
+
+    console.print(Panel(
+        f"[bold cyan]Sovereign-Code API[/]\n"
+        f"[dim]Project:[/] {project_root}\n"
+        f"[dim]Listening on:[/] http://{host}:{port}",
+        border_style="cyan",
+    ))
+
+    try:
+        import uvicorn
+        from src.api.server import create_app
+
+        api_app = create_app(
+            project_root=str(project_root),
+            qdrant_host=config.get("qdrant_host", "localhost"),
+            qdrant_port=config.get("qdrant_port", 6333),
+            embedding_provider=config.get("embedding_provider"),
+        )
+        uvicorn.run(api_app, host=host, port=port, reload=reload)
+    except ImportError:
+        console.print("[red]uvicorn not installed.[/] Run: pip install uvicorn")
+        raise typer.Exit(1)
+
+
+@app.command()
+def eval(
+    output: str = typer.Option("eval_results.json", "--output", "-o"),
+    task: Optional[str] = typer.Option(None, "--task", "-t", help="Run a specific task ID only"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Run the built-in eval harness and report agent quality metrics."""
+    _setup_logging(verbose)
+
+    from src.evals.harness import EvalSuite, BUILTIN_TASKS
+    import os
+
+    tasks = BUILTIN_TASKS
+    if task:
+        tasks = [t for t in tasks if t.id == task]
+        if not tasks:
+            console.print(f"[red]Task {task!r} not found.[/] Available: {[t.id for t in BUILTIN_TASKS]}")
+            raise typer.Exit(1)
+
+    console.print(Panel(
+        f"[bold cyan]Sovereign-Code Eval Harness[/]\n"
+        f"[dim]Running {len(tasks)} task(s)[/]",
+        border_style="cyan",
+    ))
+
+    suite = EvalSuite(tasks)
+    results_list = []
+
+    def on_done(result):
+        icon = "[green]✓[/]" if result.passed else "[red]✗[/]"
+        console.print(f"  {icon} {result.task_id}  [dim]{result.total_steps} steps · {result.latency_ms:.0f}ms[/]")
+        if not result.passed:
+            for passed, reason in result.assertion_results:
+                if not passed:
+                    console.print(f"    [red]↳ {reason}[/]")
+
+    report = suite.run(
+        groq_api_key=os.environ.get("GROQ_API_KEY"),
+        gemini_api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"),
+        on_task_done=on_done,
+    )
+
+    # Summary table
+    table = Table(title="[bold]Eval Results[/]", border_style="cyan")
+    table.add_column("Metric"); table.add_column("Value", justify="right")
+    table.add_row("Tasks", f"{len(report.results)}")
+    table.add_row("Passed", f"[green]{report.passed_count}[/]")
+    table.add_row("Success rate", f"[bold]{report.task_success_rate:.1%}[/]")
+    table.add_row("Avg steps", f"{report.avg_steps:.1f}")
+    table.add_row("Avg latency", f"{report.avg_latency_ms:.0f}ms")
+    table.add_row("Tool accuracy", f"{report.tool_accuracy:.1%}")
+    table.add_row("Total time", f"{report.total_elapsed_seconds:.1f}s")
+    console.print(table)
+
+    report.save(output)
+    console.print(f"[dim]Results saved to {output}[/]")
+
 
 def main():
     app()

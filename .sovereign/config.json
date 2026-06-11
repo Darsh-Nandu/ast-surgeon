@@ -1,0 +1,6 @@
+{
+  "project_root": "C:\\Users\\91702\\Desktop\\BoyWithNuke\\Sovereign-Code",
+  "qdrant_host": "localhost",
+  "qdrant_port": 6333,
+  "embedding_provider": null
+}

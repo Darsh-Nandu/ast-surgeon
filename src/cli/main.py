@@ -278,12 +278,20 @@ def search(
 def chat(
     path: str = typer.Argument(".", help="Project directory"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Override LLM model"),
+    resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume a previous session by ID"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
-    """Start an interactive chat session with the coding agent.
+    """Start or resume an interactive chat session with the coding agent.
+
+    New session:
+        sovereign chat
+
+    Resume a previous session:
+        sovereign chat --resume <session-id>
 
     The agent has access to your indexed codebase and can read, write,
     search, and run commands in your project.
+    Each session gets its own isolated Qdrant vector collection.
     """
     _setup_logging(verbose)
     project_root = _find_project_root(Path(path))
@@ -297,7 +305,7 @@ def chat(
 
     console.print(Panel(
         "[bold cyan]Sovereign-Code Agent[/]\n"
-        "[dim]Type your question or task. Use [bold]/help[/dim][dim] for commands, [bold]/exit[/dim][dim] to quit.[/]",
+        "[dim]Type your question or task. /help for commands, /exit to quit.[/]",
         border_style="cyan",
     ))
     console.print(f"[dim]Project: {project_root}[/]\n")
@@ -305,9 +313,76 @@ def chat(
     session = ChatSession(
         project_root=project_root,
         config=config,
+        session_id=resume,
         model=model,
     )
     session.run_repl()
+
+
+@app.command()
+def sessions(
+    path: str = typer.Argument(".", help="Project directory"),
+    delete: Optional[str] = typer.Option(None, "--delete", "-d", help="Delete a session by ID"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """List all saved sessions for this project.
+
+    Each session has its own conversation history and Qdrant collection.
+
+    Resume a session:
+        sovereign chat --resume <session-id>
+
+    Delete a session (also removes its Qdrant collection):
+        sovereign sessions --delete <session-id>
+    """
+    _setup_logging(verbose)
+    project_root = _find_project_root(Path(path))
+    config = _load_config(project_root)
+
+    from src.components.agent.session_manager import SessionManager
+    sm = SessionManager(project_root)
+
+    if delete:
+        try:
+            sm.delete(
+                delete,
+                drop_qdrant_collection=True,
+                qdrant_host=config.get("qdrant_host", "localhost"),
+                qdrant_port=config.get("qdrant_port", 6333),
+            )
+            console.print(f"[green]Deleted session[/] [cyan]{delete[:8]}[/]")
+        except FileNotFoundError:
+            console.print(f"[red]Session not found:[/] {delete}")
+        return
+
+    all_sessions = sm.list_sessions()
+
+    if not all_sessions:
+        console.print("[dim]No saved sessions. Start one with [bold]sovereign chat[/bold].[/]")
+        return
+
+    table = Table(
+        "Short ID", "Full UUID", "Turns", "Files", "Last active",
+        box=None, show_header=True, header_style="bold dim",
+    )
+    for s in all_sessions:
+        table.add_row(
+            f"[cyan]{s.session_id[:8]}[/]",
+            f"[dim]{s.session_id}[/]",
+            str(s.turn_count),
+            str(len(s.files_modified)),
+            s.age_str(),
+        )
+
+    console.print(Panel(
+        table,
+        title=f"[bold]Sessions ({len(all_sessions)})[/]",
+        border_style="dim",
+    ))
+    console.print(
+        "[dim]Resume:[/] [bold]sovereign chat --resume <full-uuid>[/bold]  "
+        "  [dim]Delete:[/] [bold]sovereign sessions --delete <full-uuid>[/bold]"
+    )
 
 
 # Watcher helper (used by init --watch)

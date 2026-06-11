@@ -1,5 +1,5 @@
 """
-Eval harness — SWE-bench-style benchmark for the Sovereign-Code agent.
+Eval harness - SWE-bench-style benchmark for the Sovereign-Code agent.
 
 WHY a custom harness instead of raw SWE-bench:
   SWE-bench requires Docker, a full repo checkout per task, and a patch-apply
@@ -19,7 +19,7 @@ Metrics we track:
 
 DESIGN NOTE on EvalTask structure:
   Each task has:
-  - setup_files: {relative_path: content} — written to tmp dir before agent runs
+  - setup_files: {relative_path: content} - written to tmp dir before agent runs
   - query: the natural language task given to the agent
   - assertions: list of Assertion objects checked after agent completes
   - max_steps: ceiling passed to the agent
@@ -138,7 +138,7 @@ class EvalResult:
         }
 
 
-# EvalSuite — collection of tasks + runner
+# EvalSuite - collection of tasks + runner
 
 class EvalSuite:
     """Runs a set of EvalTasks against a real AgentLoop and reports metrics.
@@ -201,7 +201,7 @@ class EvalSuite:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
 
-            # Create a fresh AgentLoop (no Qdrant for evals — too slow to index per task)
+            # Create a fresh AgentLoop (no Qdrant for evals - too slow to index per task)
             loop = AgentLoop.create(
                 project_root=str(root),
                 groq_api_key=groq_api_key,
@@ -288,7 +288,7 @@ class EvalReport:
 
     def by_tag(self, tag: str) -> "EvalReport":
         """Filter results to tasks with a specific tag."""
-        # We don't store task refs in results — return self for now
+        # We don't store task refs in results - return self for now
         return self
 
     def to_dict(self) -> dict:
@@ -332,7 +332,7 @@ BUILTIN_TASKS: list[EvalTask] = [
     EvalTask(
         id="fix_bug_off_by_one",
         description="Agent fixes an off-by-one bug in a list function",
-        query="There is a bug in src/list_utils.py in the `last_n` function — it returns one too many items. Fix it.",
+        query="There is a bug in src/list_utils.py in the `last_n` function - it returns one too many items. Fix it.",
         setup_files={
             "src/list_utils.py": '''\
 def last_n(items, n):

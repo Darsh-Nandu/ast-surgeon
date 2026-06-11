@@ -49,11 +49,13 @@ class Orchestrator:
         project_root: str | Path,
         vector_store=None,
         embed_pipeline=None,
+        indexer=None,
     ):
         self._router = router
         self._root = Path(project_root)
         self._store = vector_store
         self._pipeline = embed_pipeline
+        self._indexer = indexer          # optional live-reindex after writes
         self._synthesiser = Synthesiser(router)
 
     # ─── Public ──────────────────────────────────────────────────────────────
@@ -205,7 +207,26 @@ class Orchestrator:
     ) -> list[StepTrace]:
         from ..tools.file_tools import ToolRegistry
 
-        tool_registry = ToolRegistry(self._root)
+        # Wire live-reindex: after every write_file/edit_file the file is
+        # immediately re-embedded into the session Qdrant collection so
+        # subsequent SubAgents can find it via _observe().
+        on_file_write = None
+        if self._indexer is not None:
+            def on_file_write(path: str, _idx=self._indexer) -> None:
+                try:
+                    result = _idx.reindex_file(path)
+                    import logging
+                    logging.getLogger(__name__).debug(
+                        "Auto-reindexed %s: +%d/-%d chunks",
+                        path, result.chunks_added, result.chunks_deleted,
+                    )
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Auto-reindex failed for %s: %s", path, exc
+                    )
+
+        tool_registry = ToolRegistry(self._root, on_file_write=on_file_write)
         agent = SubAgent(
             subtask=subtask,
             router=self._router,

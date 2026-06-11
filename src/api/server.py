@@ -113,11 +113,23 @@ def create_app(
         """Startup: wire up AgentLoop and Indexer."""
         logger.info("Starting Sovereign-Code API for %s", project_root)
         try:
+            # Create or resume a session for the API server process
+            from ..components.memory import SessionManager
+            _sovereign_dir = Path(project_root) / ".sovereign"
+            _session_mgr = SessionManager(_sovereign_dir, project_root=project_root)
+            _api_session, _is_new = _session_mgr.get_or_create_session()
+            logger.info(
+                "%s API session %s",
+                "Created" if _is_new else "Resumed",
+                _api_session.session_id,
+            )
+
             state["agent_loop"] = AgentLoop.create(
                 project_root=project_root,
                 qdrant_host=qdrant_host,
                 qdrant_port=qdrant_port,
                 embedding_provider=embedding_provider,
+                session=_api_session,
             )
             state["indexer"] = Indexer.create(
                 project_root=project_root,

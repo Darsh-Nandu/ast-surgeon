@@ -1,25 +1,25 @@
 """
 ChatSession — the interactive REPL that connects the user to the agent.
 
-WHY this is a separate module from main.py:
-  main.py owns CLI argument parsing and startup. ChatSession owns the
-  conversation loop, message history, and session-level state (which files
-  were modified, tool call history, etc.). Separating them lets us test
-  the session logic without a TTY.
+SESSION LIFECYCLE:
+  On `sovereign chat`:
+    - Creates a new session via SessionManager
+    - Prints the session ID (save it to resume later)
 
-DESIGN NOTE on message history:
-  We maintain a full message history list that gets sent to the LLM on every
-  turn. This is the standard multi-turn approach — no summarisation yet.
-  Phase 4's deep agent will plug in here and replace the simple completion
-  call with a full planning + tool-use loop.
+  On `sovereign chat --resume <session_id>`:
+    - Loads history + session metadata from .sovereign/sessions/<id>/
+    - Uses the same per-session Qdrant collection
+    - Resumes conversation exactly where it left off
 
-Slash commands (handled locally, never sent to LLM):
-  /help     — show available commands
-  /status   — show index stats
-  /search   — quick semantic search
-  /files    — list recent file modifications
-  /clear    — clear conversation history
-  /exit     — exit the session
+Slash commands:
+  /help          show available commands
+  /status        show index and session stats
+  /session       show current session info
+  /sessions      list all sessions for this project
+  /search <q>    quick semantic search
+  /files         list files modified this session
+  /clear         clear conversation history (keeps session)
+  /exit          exit (session is saved automatically)
 """
 
 from __future__ import annotations
@@ -32,33 +32,36 @@ from typing import Optional
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.syntax import Syntax
 from rich.table import Table
+from rich.text import Text
 
 console = Console()
 
 SLASH_COMMANDS = {
-    "/help":   "Show this help message",
-    "/status": "Show index and session stats",
-    "/search <query>": "Quick semantic search",
-    "/files":  "Show files modified this session",
-    "/clear":  "Clear conversation history",
-    "/exit":   "Exit the session",
+    "/help":            "Show this help message",
+    "/status":          "Show index and session stats",
+    "/session":         "Show current session ID and info",
+    "/sessions":        "List all saved sessions for this project",
+    "/search <query>":  "Quick semantic search",
+    "/files":           "Show files modified this session",
+    "/clear":           "Clear conversation history (keeps session alive)",
+    "/exit":            "Exit (session saved automatically)",
 }
 
 
 class ChatSession:
-    """Manages one interactive chat session with the agent.
+    """
+    Interactive REPL backed by a persisted AgentLoop session.
 
-    Currently wraps a simple LLM completion call with tool context injected
-    into the system prompt. Phase 4 will replace _get_response() with the
-    full deep agent loop (planner → tool dispatcher → observer → synthesiser).
+    History and the per-session Qdrant collection are both scoped to
+    session.session_id so every chat session is fully isolated.
     """
 
     def __init__(
         self,
         project_root: Path,
         config: dict,
+        session_id: Optional[str] = None,
         model: Optional[str] = None,
     ):
         self._root = project_root
@@ -66,21 +69,37 @@ class ChatSession:
         self._model = model
         self._session_start = time.time()
 
-        # Phase 4: wire in the full AgentLoop
         from src.components.agent.loop import AgentLoop
-        self._agent_loop = AgentLoop.create(
-            project_root=project_root,
-            qdrant_host=config.get("qdrant_host", "localhost"),
-            qdrant_port=config.get("qdrant_port", 6333),
-            embedding_provider=config.get("embedding_provider"),
-        )
 
-        # Keep tool registry for /files slash command
+        if session_id:
+            self._agent_loop = AgentLoop.for_session(
+                session_id=session_id,
+                project_root=project_root,
+                qdrant_host=config.get("qdrant_host", "localhost"),
+                qdrant_port=config.get("qdrant_port", 6333),
+                embedding_provider=config.get("embedding_provider"),
+            )
+            console.print(
+                f"[dim]Resumed session [cyan]{session_id[:8]}[/] "
+                f"({self._agent_loop.session.turn_count} turns)[/]"
+            )
+        else:
+            self._agent_loop = AgentLoop.for_new_session(
+                project_root=project_root,
+                qdrant_host=config.get("qdrant_host", "localhost"),
+                qdrant_port=config.get("qdrant_port", 6333),
+                embedding_provider=config.get("embedding_provider"),
+            )
+            sid = self._agent_loop.session_id
+            console.print(
+                f"[dim]New session [cyan]{sid[:8]}[/cyan] "
+                f"(resume later with [bold]sovereign chat --resume {sid}[/bold])[/]"
+            )
+
         from src.components.tools.file_tools import ToolRegistry
         self._tools = ToolRegistry(project_root)
 
-
-    # REPL
+    # ─── REPL ─────────────────────────────────────────────────────────────────
 
     def run_repl(self) -> None:
         """Run the interactive chat loop until /exit or Ctrl+C."""
@@ -88,27 +107,23 @@ class ChatSession:
             try:
                 user_input = console.input("[bold cyan]You:[/] ").strip()
             except (KeyboardInterrupt, EOFError):
-                console.print("\n[dim]Session ended.[/]")
+                console.print("\n[dim]Session saved.[/]")
                 break
 
             if not user_input:
                 continue
 
-            # Slash command handling
             if user_input.startswith("/"):
                 should_exit = self._handle_slash(user_input)
                 if should_exit:
                     break
                 continue
 
-            # Regular message → agent
             self._chat_turn(user_input)
 
-
-    # Slash commands
+    # ─── Slash commands ───────────────────────────────────────────────────────
 
     def _handle_slash(self, command: str) -> bool:
-        """Handle a slash command. Returns True if session should exit."""
         parts = command.split(None, 1)
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
@@ -124,8 +139,14 @@ class ChatSession:
             console.print(Panel(table, title="[bold]Commands[/]", border_style="dim"))
 
         elif cmd == "/clear":
-            self._history.clear()
+            self._agent_loop.clear_history()
             console.print("[dim]Conversation history cleared.[/]")
+
+        elif cmd == "/session":
+            self._show_current_session()
+
+        elif cmd == "/sessions":
+            self._show_all_sessions()
 
         elif cmd == "/status":
             self._show_status()
@@ -140,160 +161,79 @@ class ChatSession:
                 self._quick_search(args)
 
         else:
-            console.print(f"[yellow]Unknown command:[/] {cmd}. Type [cyan]/help[/] for options.")
+            console.print(
+                f"[yellow]Unknown command:[/] {cmd}. Type [cyan]/help[/] for options."
+            )
 
         return False
 
-    # Agent turn
+    # ─── Agent turn ───────────────────────────────────────────────────────────
 
     def _chat_turn(self, user_message: str) -> None:
-        """Process one user message through the full AgentLoop pipeline."""
         console.print()
-
-        # Show live plan/step updates as the agent works
-        with console.status("[dim]Agent working...[/]", spinner="dots") as status:
+        with console.status("[dim]Agent working…[/]", spinner="dots"):
             result = self._agent_loop.run(user_message)
 
-        # Render response
         console.print("[bold green]Agent:[/]")
         console.print(Markdown(result.response))
         console.print()
-
-        # Show what the agent actually did (files, commands, steps)
         self._render_agent_actions(result)
 
-    def _retrieve_context(self, query: str, top_k: int = 6) -> list:
-        """Retrieve relevant code chunks for the query."""
-        if not self._store or not self._pipeline:
-            return []
-        try:
-            query_vec = self._pipeline.embed_query(query)
-            return self._store.search(query_vec, top_k=top_k)
-        except Exception:
-            return []
+    # ─── Display helpers ──────────────────────────────────────────────────────
 
-    def _build_system_prompt(self, context_chunks: list) -> str:
-        """Build the system prompt injected with retrieved context and tool schemas."""
-        project_name = self._root.name
+    def _show_current_session(self) -> None:
+        s = self._agent_loop.session
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_row("[dim]Session ID[/]",   f"[cyan]{s.session_id}[/]")
+        table.add_row("[dim]Collection[/]",   f"[dim]{s.collection_name}[/]")
+        table.add_row("[dim]Turns[/]",        str(s.turn_count))
+        table.add_row("[dim]Last active[/]",  s.age_str())
+        table.add_row("[dim]History msgs[/]", str(len(s.history)))
+        table.add_row("[dim]Files modified[/]", str(len(s.files_modified)))
+        console.print(
+            Panel(table, title="[bold]Current Session[/]", border_style="cyan")
+        )
+        console.print(
+            f"[dim]Resume with:[/] [bold]sovereign chat --resume {s.session_id}[/bold]"
+        )
 
-        # Context section
-        context_section = ""
-        if context_chunks:
-            context_section = "\n\n## Relevant Code Context\n"
-            for r in context_chunks:
-                chunk = r.chunk
-                context_section += (
-                    f"\n### {chunk.name or 'block'} "
-                    f"({chunk.file_path}:{chunk.start_line}-{chunk.end_line})\n"
-                    f"```{chunk.language}\n{chunk.content}\n```\n"
-                )
+    def _show_all_sessions(self) -> None:
+        from src.components.agent.session_manager import SessionManager
+        sm = SessionManager(self._root)
+        sessions = sm.list_sessions()
 
-        # Tool schemas
-        tools_section = "\n\n## Available Tools\n"
-        for schema in self._tools.schemas():
-            tools_section += f"- **{schema['name']}**: {schema['description']}\n"
-            for param, spec in schema.get("parameters", {}).items():
-                if not spec.get("optional"):
-                    tools_section += f"  - `{param}` ({spec['type']}): {spec.get('description','')}\n"
+        if not sessions:
+            console.print("[dim]No saved sessions.[/]")
+            return
 
-        return f"""You are Sovereign-Code, a production-grade coding agent working on the **{project_name}** project.
-
-You have deep knowledge of the codebase through semantic search. You can read files, write code, run tests, and search the project.
-
-## Project Root
-{self._root}
-{context_section}{tools_section}
-
-## Instructions
-- Answer concisely and accurately
-- When you need to read a file, say so — the user can invoke tools explicitly
-- When suggesting code changes, show diffs or the new file content clearly
-- Reference specific file paths and line numbers when discussing code
-- If you're unsure about something in the codebase, say so rather than guessing
-
-**Phase 4 note:** Full autonomous tool execution is coming in the next phase. For now, suggest tool calls and the user can execute them.
-"""
-
-    def _get_response(self, system_prompt: str) -> str:
-        """Call the LLM. Phase 4 replaces this with the deep agent loop."""
-        import os
-
-        # Try Groq first, then Gemini, then fallback message
-        groq_key = os.environ.get("GROQ_API_KEY")
-        gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-
-        messages = [{"role": "user", "content": m["content"]}
-                    if m["role"] == "user" else m
-                    for m in self._history]
-
-        if groq_key:
-            return self._call_groq(system_prompt, messages, groq_key)
-        elif gemini_key:
-            return self._call_gemini(system_prompt, messages, gemini_key)
-        else:
-            return (
-                "⚠️  No LLM API key found.\n\n"
-                "Set one of:\n"
-                "- `GROQ_API_KEY` (recommended: llama-3.3-70b-versatile, fast + free)\n"
-                "- `GEMINI_API_KEY` (gemini-2.0-flash)\n\n"
-                "The retrieval context and tools are ready — just needs a model."
+        table = Table(
+            "ID (short)",
+            "Full UUID",
+            "Turns",
+            "Files",
+            "Last active",
+            box=None,
+            show_header=True,
+            header_style="bold dim",
+        )
+        for s in sessions:
+            is_current = s.session_id == self._agent_loop.session_id
+            sid_display = (
+                f"[cyan bold]{s.session_id[:8]}[/] ◄ current"
+                if is_current
+                else f"[cyan]{s.session_id[:8]}[/]"
+            )
+            table.add_row(
+                sid_display,
+                f"[dim]{s.session_id}[/]",
+                str(s.turn_count),
+                str(len(s.files_modified)),
+                s.age_str(),
             )
 
-    def _call_groq(self, system_prompt: str, messages: list, api_key: str) -> str:
-        import httpx
-        model = self._model or "llama-3.3-70b-versatile"
-        try:
-            resp = httpx.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "system", "content": system_prompt}] + messages,
-                    "max_tokens": 4096,
-                    "temperature": 0.2,
-                },
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            return f"[Groq error: {e}]"
-
-    def _call_gemini(self, system_prompt: str, messages: list, api_key: str) -> str:
-        import httpx
-        model = self._model or "gemini-2.0-flash"
-        # Convert messages to Gemini format
-        contents = []
-        for m in messages:
-            role = "user" if m["role"] == "user" else "model"
-            contents.append({"role": role, "parts": [{"text": m["content"]}]})
-
-        try:
-            resp = httpx.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                params={"key": api_key},
-                json={
-                    "system_instruction": {"parts": [{"text": system_prompt}]},
-                    "contents": contents,
-                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096},
-                },
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception as e:
-            return f"[Gemini error: {e}]"
-
-    def _process_response(self, response: str) -> str:
-        """Parse response for tool calls and execute them.
-
-        Phase 4 will handle this fully autonomously in the agent loop.
-        For now we just return the response as-is.
-        """
-        return response
-
-
-    # Display helpers
+        console.print(
+            Panel(table, title=f"[bold]Sessions ({len(sessions)})[/]", border_style="dim")
+        )
 
     def _quick_search(self, query: str) -> None:
         store = self._agent_loop._store
@@ -320,36 +260,39 @@ You have deep knowledge of the codebase through semantic search. You can read fi
         from src.components.sync.manifest import ManifestStore
         ms = ManifestStore(self._root)
         manifest = ms.load()
-        stats = ms.stats(manifest)
+        stats = ms.stats(manifest) if manifest else {"files": 0, "chunks": 0}
+
+        s = self._agent_loop.session
 
         table = Table(show_header=False, box=None)
-        table.add_row("[dim]Project[/]", str(self._root))
-        table.add_row("[dim]Files indexed[/]", str(stats["files"]))
-        table.add_row("[dim]Chunks[/]", str(stats["chunks"]))
+        table.add_row("[dim]Project[/]",         str(self._root))
+        table.add_row("[dim]Session ID[/]",       f"[cyan]{s.session_id[:8]}[/]")
+        table.add_row("[dim]Collection[/]",       f"[dim]{s.collection_name}[/]")
+        table.add_row("[dim]Files indexed[/]",    str(stats.get("files", 0)))
+        table.add_row("[dim]Chunks[/]",           str(stats.get("chunks", 0)))
+        table.add_row("[dim]Session turns[/]",    str(s.turn_count))
         table.add_row("[dim]Session duration[/]", f"{(time.time() - self._session_start):.0f}s")
-        table.add_row("[dim]Messages[/]", str(len(self._history)))
         console.print(Panel(table, title="Status", border_style="dim"))
 
     def _show_modified_files(self) -> None:
-        from src.components.tools.file_tools import WriteFileTool
-        write_tool = self._tools._tools.get("write_file")
-        log = write_tool.write_log if write_tool else []
-        if not log:
+        files = self._agent_loop.session.files_modified
+        if not files:
             console.print("[dim]No files modified this session.[/]")
             return
-        for entry in log:
-            action = "[green]created[/]" if entry["created"] else "[yellow]updated[/]"
-            console.print(f"  {action}  {entry['path']}  [dim]({entry['lines']} lines)[/]")
+        for f in files:
+            console.print(f"  [cyan]{f}[/]")
 
     def _render_agent_actions(self, result) -> None:
-        """Show a compact summary of what the agent did this turn."""
-        from .session import console  # avoid circular if needed
         parts = []
         if result.files_modified:
-            parts.append(f"[dim]📝 {len(result.files_modified)} file(s) modified:[/] " +
-                         ", ".join(f"[cyan]{f}[/]" for f in result.files_modified[:4]))
+            parts.append(
+                f"[dim]📝 {len(result.files_modified)} file(s) modified:[/] "
+                + ", ".join(f"[cyan]{f}[/]" for f in result.files_modified[:4])
+            )
         if result.commands_run:
-            parts.append(f"[dim]⚡ Ran:[/] [dim]{result.commands_run[-1][:60]}[/]")
+            parts.append(
+                f"[dim]⚡ Ran:[/] [dim]{result.commands_run[-1][:60]}[/]"
+            )
         if result.total_steps:
             mode_icon = "⚡" if result.mode.value == "direct" else "🔀"
             parts.append(
@@ -357,6 +300,8 @@ You have deep knowledge of the codebase through semantic search. You can read fi
                 f"{result.total_steps} step(s) · "
                 f"{result.total_latency_ms:.0f}ms[/]"
             )
+        if result.sleep_mode:
+            parts.append("[yellow]⚠ Pipeline entered sleep mode[/]")
         if not result.success and result.error:
             parts.append(f"[red]Error: {result.error[:80]}[/]")
         for part in parts:
@@ -365,8 +310,11 @@ You have deep knowledge of the codebase through semantic search. You can read fi
             console.print()
 
     def _show_session_summary(self) -> None:
+        s = self._agent_loop.session
         duration = time.time() - self._session_start
         console.print(Panel(
-            f"[dim]Session ended after {duration:.0f}s  ·  {len(self._history)} messages[/]",
+            f"[dim]Session [cyan]{s.session_id[:8]}[/cyan] saved · "
+            f"{s.turn_count} turns · {duration:.0f}s[/]\n"
+            f"[dim]Resume:[/] [bold]sovereign chat --resume {s.session_id}[/bold]",
             border_style="dim",
         ))

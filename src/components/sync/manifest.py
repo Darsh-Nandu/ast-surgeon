@@ -45,10 +45,14 @@ class ManifestStore:
         ms.remove_file(manifest, path)          # file deleted → remove + save
     """
 
-    def __init__(self, project_root: str | Path):
+    def __init__(self, project_root: str | Path, manifest_path: str | Path | None = None):
         self._root = Path(project_root).resolve()
         self._sovereign_dir = self._root / SOVEREIGN_DIR
-        self._manifest_path = self._sovereign_dir / MANIFEST_FILE
+        if manifest_path is not None:
+            # Allow callers to override the manifest location (e.g. per-session path)
+            self._manifest_path = Path(manifest_path)
+        else:
+            self._manifest_path = self._sovereign_dir / MANIFEST_FILE
 
 
     # Public API

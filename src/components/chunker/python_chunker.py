@@ -10,9 +10,9 @@ from typing import Optional
 import tree_sitter_python as tspython
 import tree_sitter as ts
 
-from models import ChunkType, CodeChunk
+from .models import ChunkType, CodeChunk
 
-_PY_LANGUAGE = ts.language(tspython.language())
+_PY_LANGUAGE = ts.Language(tspython.language())
 _PARSER = ts.Parser(_PY_LANGUAGE)
 
 # Public API

@@ -1,25 +1,11 @@
 """
 Agent data models — the shared language between every layer of the agent system.
 
-WHY a rich model layer:
-  Every component (Planner, SubAgent, Orchestrator, Synthesiser) communicates
-  through these typed structures. No passing raw dicts between layers.
-  This means:
-  - The eval harness (Phase 5) can replay any session from its StepTrace
-  - The CLI can render live progress from AgentResult.traces
-  - Tests can assert on specific fields without parsing LLM output strings
-
-DESIGN NOTE on TaskPlan as a DAG:
-  SubTask.dependencies is a list of other subtask IDs. The Orchestrator
-  resolves execution order by topological sort. Tasks with empty dependencies
-  run immediately and can be parallelised. This is how tools like Airflow and
-  GitHub Actions model pipelines — proven pattern for task graphs.
-
-DESIGN NOTE on StepTrace:
-  Every action every agent takes is recorded here — tool name, args, result,
-  latency, model used. This is the audit trail for debugging and evals.
-  A senior engineer at Anthropic would flag the absence of this immediately:
-  without a trace you cannot reproduce failures or measure agent quality.
+CHANGES in this version:
+  - Added PipelineHealth, SleepReason, and HealthSignal for sleep-mode detection
+  - Added SubAgentSignal enum so parent agent can reason about child agent state
+  - StepTrace now records tool_result_raw (untruncated) and health_flag
+  - AgentResult exposes sleep_mode and health_report
 """
 
 from __future__ import annotations
@@ -30,20 +16,19 @@ from typing import Any, Optional
 import time
 
 
-# Enums
+# ─── Core Enums ──────────────────────────────────────────────────────────────
 
 class TaskType(str, Enum):
-    """What kind of work a task requires — used by the Router to pick a model."""
-    PLANNING     = "planning"       # break down a problem, reason about architecture
-    CODE_GEN     = "code_gen"       # write new code
-    CODE_EDIT    = "code_edit"      # modify existing code
-    CODE_REVIEW  = "code_review"    # read and explain code
-    DEBUG        = "debug"          # find and fix bugs
-    TEST_WRITE   = "test_write"     # write tests
-    SEARCH       = "search"         # retrieve / explore codebase
-    RUN          = "run"            # execute commands / tests
-    EXPLAIN      = "explain"        # answer questions about code
-    SYNTHESISE   = "synthesise"     # merge / summarise multiple results
+    PLANNING     = "planning"
+    CODE_GEN     = "code_gen"
+    CODE_EDIT    = "code_edit"
+    CODE_REVIEW  = "code_review"
+    DEBUG        = "debug"
+    TEST_WRITE   = "test_write"
+    SEARCH       = "search"
+    RUN          = "run"
+    EXPLAIN      = "explain"
+    SYNTHESISE   = "synthesise"
 
 
 class SubTaskStatus(str, Enum):
@@ -51,92 +36,149 @@ class SubTaskStatus(str, Enum):
     RUNNING    = "running"
     DONE       = "done"
     FAILED     = "failed"
-    SKIPPED    = "skipped"   # dependency failed, so this was skipped
+    SKIPPED    = "skipped"
 
 
 class AgentMode(str, Enum):
-    DIRECT   = "direct"    # single agent loop, no subagents
-    PARALLEL = "parallel"  # orchestrator spawns subagents
+    DIRECT   = "direct"
+    PARALLEL = "parallel"
 
 
-# Step trace - one action in an agent's loop
+# ─── Health / Sleep models ────────────────────────────────────────────────────
+
+class SleepReason(str, Enum):
+    """Why the pipeline entered sleep mode."""
+    LLM_PARSE_FAILURES   = "llm_parse_failures"    # too many JSON parse errors
+    TOOL_LOOP_DETECTED   = "tool_loop_detected"     # agent stuck calling same tool
+    SUBAGENT_TIMEOUT     = "subagent_timeout"       # child agent timed out
+    CONSECUTIVE_ERRORS   = "consecutive_errors"     # N consecutive tool errors
+    LLM_ERROR_RATE       = "llm_error_rate"         # LLM calls returning errors
+    ANOMALY_DETECTED     = "anomaly_detected"       # generic anomaly signal
+
+
+@dataclass
+class HealthSignal:
+    """One health observation emitted during execution."""
+    timestamp: float = field(default_factory=time.time)
+    agent_id: str = ""
+    signal: SleepReason = SleepReason.ANOMALY_DETECTED
+    detail: str = ""
+    severity: int = 1   # 1=warn, 2=error, 3=critical
+
+
+@dataclass
+class PipelineHealth:
+    """Aggregated health state for one agent run."""
+    sleep_mode: bool = False
+    sleep_reason: Optional[SleepReason] = None
+    signals: list[HealthSignal] = field(default_factory=list)
+    consecutive_tool_errors: int = 0
+    parse_failures: int = 0
+    total_llm_errors: int = 0
+
+    def record(self, signal: HealthSignal) -> None:
+        self.signals.append(signal)
+
+    def should_sleep(self) -> tuple[bool, Optional[SleepReason]]:
+        """Evaluate whether conditions warrant sleep mode."""
+        if self.parse_failures >= 3:
+            return True, SleepReason.LLM_PARSE_FAILURES
+        if self.consecutive_tool_errors >= 4:
+            return True, SleepReason.CONSECUTIVE_ERRORS
+        if self.total_llm_errors >= 3:
+            return True, SleepReason.LLM_ERROR_RATE
+        return False, None
+
+    def summary(self) -> str:
+        if self.sleep_mode:
+            return f"⚠ SLEEP({self.sleep_reason.value}): {len(self.signals)} signals"
+        return f"Healthy: {len(self.signals)} signals, {self.consecutive_tool_errors} consecutive errors"
+
+
+# ─── SubAgent inter-agent signalling ─────────────────────────────────────────
+
+class SubAgentSignal(str, Enum):
+    """Status signal a child SubAgent sends back to its parent."""
+    PENDING   = "pending"   # not yet started
+    RUNNING   = "running"   # in progress
+    DONE      = "done"      # completed successfully
+    FAILED    = "failed"    # completed with error
+    SLEEPING  = "sleeping"  # entered sleep mode, needs intervention
+
+
+# ─── StepTrace ────────────────────────────────────────────────────────────────
 
 @dataclass
 class StepTrace:
     """Records one Observe→Think→Act cycle in an agent loop.
 
-    DESIGN NOTE: we record latency_ms so the eval harness can flag slow steps
-    and we can tune which model to use for which task type.
+    Now includes:
+      - tool_result_raw: full untruncated result for replay
+      - health_flag: True if this step contributed a health signal
+      - child_signal: signal from a child subagent if spawned this step
     """
     step_number: int
-    agent_id: str                    # which agent took this step
+    agent_id: str
     task_type: TaskType
-    model_used: str                  # e.g. "llama-3.3-70b-versatile"
-    thought: str                     # LLM's reasoning before acting
-    tool_name: Optional[str]         # None if LLM decided no tool needed
-    tool_args: dict[str, Any]        # args passed to the tool
-    tool_result: Optional[str]       # ToolResult.content (truncated if huge)
-    tool_error: bool                 # ToolResult.is_error
+    model_used: str
+    thought: str
+    tool_name: Optional[str]
+    tool_args: dict[str, Any]
+    tool_result: Optional[str]          # truncated for display
+    tool_result_raw: Optional[str]      # full result for replay
+    tool_error: bool
     latency_ms: float
     timestamp: float = field(default_factory=time.time)
+    health_flag: bool = False
+    child_signal: Optional[SubAgentSignal] = None   # set when a child was spawned
 
     def summary(self) -> str:
         status = "❌" if self.tool_error else "✓"
-        tool_part = f" → {self.tool_name}({', '.join(f'{k}={v!r}' for k,v in list(self.tool_args.items())[:2])})" if self.tool_name else " → (no tool)"
-        return f"[{self.agent_id}] step {self.step_number}{tool_part} {status}"
+        health = " ⚠" if self.health_flag else ""
+        tool_part = (
+            f" → {self.tool_name}({', '.join(f'{k}={v!r}' for k, v in list(self.tool_args.items())[:2])})"
+            if self.tool_name else " → (no tool)"
+        )
+        return f"[{self.agent_id}] step {self.step_number}{tool_part} {status}{health}"
 
 
-# SubTask - one node in the TaskPlan DAG
+# ─── SubTask ──────────────────────────────────────────────────────────────────
 
 @dataclass
 class SubTask:
-    """One unit of work in the TaskPlan.
-
-    Can be executed by a SubAgent (if complex) or directly by the Orchestrator
-    (if simple). The Planner decides which by setting spawn_subagent=True.
-
-    DESIGN NOTE on dependencies:
-      dependencies is a list of subtask IDs that must complete before this
-      one starts. Empty list = can run immediately (and in parallel with other
-      zero-dependency tasks). This is the core of the DAG execution model.
-    """
-    id: str                          # e.g. "task_0", "task_1"
-    description: str                 # what this subtask should do
+    """One unit of work in the TaskPlan DAG."""
+    id: str
+    description: str
     task_type: TaskType
-    dependencies: list[str]          # IDs of subtasks that must complete first
-    spawn_subagent: bool             # True = needs own SubAgent loop
-    context_hint: str = ""           # hint for retrieval (e.g. "AuthService login")
-    max_steps: int = 10              # hard ceiling on agent loop iterations
+    dependencies: list[str]
+    spawn_subagent: bool
+    context_hint: str = ""
+    max_steps: int = 10
 
     # Set during execution
     status: SubTaskStatus = SubTaskStatus.PENDING
-    result: Optional[str] = None     # final output of this subtask
+    result: Optional[str] = None
     error: Optional[str] = None
     traces: list[StepTrace] = field(default_factory=list)
-    agent_id: Optional[str] = None   # which agent ran this
+    agent_id: Optional[str] = None
+    signal: SubAgentSignal = SubAgentSignal.PENDING   # live status for parent
+    health: PipelineHealth = field(default_factory=PipelineHealth)
 
 
-# TaskPlan - the full DAG returned by the Planner
+# ─── TaskPlan ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class TaskPlan:
-    """The Planner's output: a DAG of subtasks + execution mode decision.
-
-    DESIGN NOTE on mode selection:
-      The Planner sets mode=PARALLEL only when there are 2+ subtasks with
-      no dependency between them AND each is complex enough to warrant its
-      own agent loop. For simple tasks, mode=DIRECT and subtasks has one entry.
-    """
+    """The Planner's output: a DAG of subtasks + execution mode decision."""
     mode: AgentMode
     subtasks: list[SubTask]
     original_query: str
-    reasoning: str                   # why the planner chose this structure
+    reasoning: str
 
     def get(self, task_id: str) -> Optional[SubTask]:
         return next((t for t in self.subtasks if t.id == task_id), None)
 
     def ready_tasks(self, completed_ids: set[str]) -> list[SubTask]:
-        """Return PENDING tasks whose dependencies are all in completed_ids."""
         return [
             t for t in self.subtasks
             if t.status == SubTaskStatus.PENDING
@@ -155,28 +197,30 @@ class TaskPlan:
         return f"TaskPlan({self.mode.value}, {len(self.subtasks)} tasks, {done} done)"
 
 
-# AgentResult - what the full loop returns to the session
+# ─── AgentResult ─────────────────────────────────────────────────────────────
 
 @dataclass
 class AgentResult:
-    """The final output of one complete agent turn.
-
-    This is what session.py receives and renders to the user.
-    The full traces are available for the eval harness.
-    """
-    response: str                    # final answer / summary to show the user
+    """The final output of one complete agent turn."""
+    response: str
     mode: AgentMode
-    plan: Optional[TaskPlan]         # None for trivial single-step responses
-    all_traces: list[StepTrace]      # every step from every agent
-    files_modified: list[str]        # paths written/edited this turn
-    commands_run: list[str]          # commands executed this turn
+    plan: Optional[TaskPlan]
+    all_traces: list[StepTrace]
+    files_modified: list[str]
+    commands_run: list[str]
     success: bool
     error: Optional[str] = None
     total_steps: int = 0
     total_latency_ms: float = 0.0
+    sleep_mode: bool = False
+    health_report: Optional[PipelineHealth] = None
 
     def step_summary(self) -> str:
-        lines = [f"Mode: {self.mode.value} | Steps: {self.total_steps} | {self.total_latency_ms:.0f}ms"]
+        lines = [
+            f"Mode: {self.mode.value} | Steps: {self.total_steps} | "
+            f"{self.total_latency_ms:.0f}ms"
+            + (" | ⚠ SLEEP MODE" if self.sleep_mode else "")
+        ]
         for trace in self.all_traces:
             lines.append(f"  {trace.summary()}")
         return "\n".join(lines)

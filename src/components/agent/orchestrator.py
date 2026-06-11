@@ -1,35 +1,21 @@
 """
 Orchestrator — executes a TaskPlan DAG, dispatching SubAgents in parallel.
 
-WHY the Orchestrator is separate from the SubAgent:
-  The Orchestrator reasons about the GRAPH of tasks — which can run now,
-  which are blocked, which failed. The SubAgent reasons about ONE task in
-  depth. Mixing these two concerns would produce an unmaintainable mess.
+KEY IMPROVEMENTS:
+  1. HEALTH AGGREGATION
+     After each subtask completes, the Orchestrator reads the subtask's
+     PipelineHealth. If any subtask entered sleep mode, the Orchestrator
+     logs it clearly and marks the final AgentResult.sleep_mode=True.
 
-Execution model:
-  1. Get the TaskPlan from the Planner
-  2. Find all tasks with no unsatisfied dependencies (ready_tasks)
-  3. If mode=PARALLEL: submit ready tasks to ThreadPoolExecutor simultaneously
-     If mode=DIRECT: run tasks one at a time (respecting dependencies)
-  4. As tasks complete, mark them done and check if new tasks are now unblocked
-  5. If a task fails and other tasks depend on it, mark those as SKIPPED
-  6. When all tasks are resolved, pass results to Synthesiser
+  2. SUBAGENT SIGNAL AWARENESS
+     The Orchestrator checks subtask.signal after completion. A SLEEPING
+     signal causes the task to be marked FAILED and dependents to be skipped,
+     exactly as if the task had crashed. A repair hook is called (stub for now,
+     will be wired to RepairAgent later).
 
-DESIGN NOTE on ThreadPoolExecutor vs asyncio:
-  We use threads, not asyncio. Reasons:
-  1. Our LLM calls (httpx) are synchronous — wrapping them in asyncio adds
-     complexity with no real benefit here.
-  2. SubAgents are CPU-light (mostly waiting on HTTP) and IO-light (small file ops).
-     Python's GIL doesn't hurt us — threads release it during IO.
-  3. ThreadPoolExecutor gives us clean futures, timeouts, and exception isolation
-     out of the box.
-
-DESIGN NOTE on per-task ToolRegistry:
-  Each SubAgent gets its OWN ToolRegistry instance pointing at the same project
-  root. This means their WriteFileTool audit logs are independent. But they all
-  write to the same filesystem — a subtask that creates a file IS visible to
-  other subtasks. This is intentional: subtask A can create a file that subtask
-  B then reads. The Synthesiser handles conflict detection.
+  3. PARALLEL EXECUTION WITH HEALTH GATE
+     If a sleeping subtask is detected mid-parallel run, remaining futures
+     still complete (no brutal cancel) but the final result reports sleep mode.
 """
 
 from __future__ import annotations
@@ -41,7 +27,8 @@ from pathlib import Path
 from typing import Optional
 
 from .models import (
-    AgentMode, SubTask, SubTaskStatus, TaskPlan, StepTrace, AgentResult
+    AgentMode, AgentResult, PipelineHealth, SleepReason, SubAgentSignal,
+    SubTask, SubTaskStatus, TaskPlan, StepTrace,
 )
 from .router import ModelRouter
 from .subagent import SubAgent
@@ -49,19 +36,12 @@ from .synthesiser import Synthesiser
 
 logger = logging.getLogger(__name__)
 
-# Max parallel subagents - keeps API rate limits manageable
 MAX_WORKERS = 4
-# Per-subtask wall-clock timeout in seconds
 SUBTASK_TIMEOUT = 300
 
 
 class Orchestrator:
-    """Executes a TaskPlan, managing SubAgent lifecycle and parallelism.
-
-    Usage:
-        orch = Orchestrator(router, project_root, store, pipeline)
-        result = orch.execute(plan, conversation_history)
-    """
+    """Executes a TaskPlan, managing SubAgent lifecycle and parallelism."""
 
     def __init__(
         self,
@@ -76,23 +56,13 @@ class Orchestrator:
         self._pipeline = embed_pipeline
         self._synthesiser = Synthesiser(router)
 
-
-    # Public
+    # ─── Public ──────────────────────────────────────────────────────────────
 
     def execute(
         self,
         plan: TaskPlan,
         conversation_history: Optional[list[dict]] = None,
     ) -> AgentResult:
-        """Execute the full TaskPlan and return a synthesised AgentResult.
-
-        Args:
-            plan:                   TaskPlan from the Planner.
-            conversation_history:   Prior session turns for multi-turn context.
-
-        Returns:
-            AgentResult with final response, all traces, and side-effect lists.
-        """
         t0 = time.monotonic()
         logger.info("Orchestrator: %s", plan.summary())
 
@@ -101,37 +71,48 @@ class Orchestrator:
         else:
             all_traces = self._run_parallel(plan, conversation_history)
 
-        # Collect side effects from all subtasks
+        # ── Aggregate health across all subtasks ──────────────────────────
+        aggregate_health = self._aggregate_health(plan)
+
+        # ── Collect side effects ──────────────────────────────────────────
         files_modified = self._collect_files_modified(plan)
         commands_run = self._collect_commands_run(plan)
 
-        # Synthesise results into one coherent response
+        # ── Synthesise ────────────────────────────────────────────────────
         result = self._synthesiser.synthesise(
             plan=plan,
             all_traces=all_traces,
             conversation_history=conversation_history or [],
+            aggregate_health=aggregate_health,
         )
 
         result.files_modified = files_modified
         result.commands_run = commands_run
         result.total_steps = len(all_traces)
         result.total_latency_ms = (time.monotonic() - t0) * 1000
+        result.sleep_mode = aggregate_health.sleep_mode
+        result.health_report = aggregate_health
+
+        if aggregate_health.sleep_mode:
+            logger.warning(
+                "Orchestrator: pipeline entered SLEEP MODE — reason=%s",
+                aggregate_health.sleep_reason.value if aggregate_health.sleep_reason else "?",
+            )
 
         logger.info(
-            "Orchestrator done: %d steps, %.0fms, %d files modified",
-            result.total_steps, result.total_latency_ms, len(files_modified)
+            "Orchestrator done: %d steps, %.0fms, %d files modified, sleep=%s",
+            result.total_steps, result.total_latency_ms,
+            len(files_modified), aggregate_health.sleep_mode,
         )
         return result
 
-
-    # Execution modes
+    # ─── Execution modes ─────────────────────────────────────────────────────
 
     def _run_direct(
         self,
         plan: TaskPlan,
         conversation_history: Optional[list[dict]],
     ) -> list[StepTrace]:
-        """Execute tasks sequentially, respecting dependency order."""
         all_traces: list[StepTrace] = []
         completed: set[str] = set()
 
@@ -144,13 +125,7 @@ class Orchestrator:
             for subtask in ready:
                 traces = self._run_one_task(subtask, conversation_history)
                 all_traces.extend(traces)
-
-                if subtask.status == SubTaskStatus.DONE:
-                    completed.add(subtask.id)
-                else:
-                    # Mark dependents as skipped
-                    self._skip_dependents(plan, subtask.id)
-                    completed.add(subtask.id)
+                self._handle_post_task(plan, subtask, completed)
 
         return all_traces
 
@@ -159,7 +134,6 @@ class Orchestrator:
         plan: TaskPlan,
         conversation_history: Optional[list[dict]],
     ) -> list[StepTrace]:
-        """Execute independent tasks in parallel, blocked tasks sequentially after."""
         all_traces: list[StepTrace] = []
         completed: set[str] = set()
 
@@ -169,7 +143,6 @@ class Orchestrator:
                 if not ready:
                     break
 
-                # Submit all ready tasks in parallel
                 futures: dict[Future, SubTask] = {}
                 for subtask in ready:
                     if subtask.spawn_subagent:
@@ -179,14 +152,11 @@ class Orchestrator:
                         futures[future] = subtask
                         logger.info("Submitted subagent for: %s", subtask.id)
                     else:
-                        # Simple tasks run inline (no thread overhead)
+                        # Simple tasks run inline
                         traces = self._run_one_task(subtask, conversation_history)
                         all_traces.extend(traces)
-                        completed.add(subtask.id)
-                        if subtask.status != SubTaskStatus.DONE:
-                            self._skip_dependents(plan, subtask.id)
+                        self._handle_post_task(plan, subtask, completed)
 
-                # Collect futures
                 for future in as_completed(futures, timeout=SUBTASK_TIMEOUT):
                     subtask = futures[future]
                     try:
@@ -197,26 +167,20 @@ class Orchestrator:
                         subtask.status = SubTaskStatus.FAILED
                         subtask.error = str(exc)
 
-                    completed.add(subtask.id)
-                    if subtask.status != SubTaskStatus.DONE:
-                        self._skip_dependents(plan, subtask.id)
+                    self._handle_post_task(plan, subtask, completed)
 
         return all_traces
 
-
-    # Task execution
+    # ─── Task execution ──────────────────────────────────────────────────────
 
     def _run_one_task(
         self,
         subtask: SubTask,
         conversation_history: Optional[list[dict]],
     ) -> list[StepTrace]:
-        """Run a single subtask — either via SubAgent loop or inline for simple tasks."""
         from ..tools.file_tools import ToolRegistry
 
-        # Each SubAgent gets its own ToolRegistry (isolated audit log)
         tool_registry = ToolRegistry(self._root)
-
         agent = SubAgent(
             subtask=subtask,
             router=self._router,
@@ -235,20 +199,79 @@ class Orchestrator:
 
         return agent.traces
 
+    def _handle_post_task(
+        self,
+        plan: TaskPlan,
+        subtask: SubTask,
+        completed: set[str],
+    ) -> None:
+        """Post-task bookkeeping: signal checks, dependency propagation."""
+        completed.add(subtask.id)
 
-    # Helpers
+        # Check if subtask entered sleep mode
+        if subtask.signal == SubAgentSignal.SLEEPING:
+            logger.warning(
+                "SubTask %s entered SLEEP MODE — skipping dependents. "
+                "Future: RepairAgent will be invoked here.",
+                subtask.id,
+            )
+            subtask.status = SubTaskStatus.FAILED
+            if not subtask.error:
+                subtask.error = f"sleep_mode: {subtask.health.sleep_reason}"
+            # --- REPAIR HOOK (stub) ---
+            self._repair_hook(subtask, plan)
+
+        if subtask.status != SubTaskStatus.DONE:
+            self._skip_dependents(plan, subtask.id)
+
+    def _repair_hook(self, sleeping_subtask: SubTask, plan: TaskPlan) -> None:
+        """
+        Stub called when a subtask enters sleep mode.
+
+        In a future iteration, this will:
+          1. Instantiate a RepairAgent with the sleep reason and full health signals
+          2. Let the RepairAgent diagnose and attempt to fix the pipeline
+          3. If repair succeeds, re-queue the sleeping subtask
+
+        For now: log clearly and mark as failed so the session reports it.
+        """
+        logger.warning(
+            "[REPAIR_HOOK] SubTask %s slept: reason=%s, signals=%d. "
+            "RepairAgent not yet implemented — marking failed.",
+            sleeping_subtask.id,
+            sleeping_subtask.health.sleep_reason,
+            len(sleeping_subtask.health.signals),
+        )
+
+    # ─── Health aggregation ───────────────────────────────────────────────────
+
+    def _aggregate_health(self, plan: TaskPlan) -> PipelineHealth:
+        """Merge health from all subtasks into one aggregate view."""
+        agg = PipelineHealth()
+        for subtask in plan.subtasks:
+            h = subtask.health
+            agg.parse_failures += h.parse_failures
+            agg.total_llm_errors += h.total_llm_errors
+            agg.consecutive_tool_errors = max(
+                agg.consecutive_tool_errors, h.consecutive_tool_errors
+            )
+            for signal in h.signals:
+                agg.signals.append(signal)
+            if h.sleep_mode:
+                agg.sleep_mode = True
+                agg.sleep_reason = h.sleep_reason  # last one wins (fine for now)
+        return agg
+
+    # ─── Helpers ─────────────────────────────────────────────────────────────
 
     def _skip_dependents(self, plan: TaskPlan, failed_id: str) -> None:
-        """Mark all tasks that depend on a failed task as SKIPPED."""
         for task in plan.subtasks:
             if failed_id in task.dependencies and task.status == SubTaskStatus.PENDING:
                 task.status = SubTaskStatus.SKIPPED
                 logger.info("Skipped %s (dependency %s failed)", task.id, failed_id)
-                # Cascade: skip tasks that depend on this skipped task
                 self._skip_dependents(plan, task.id)
 
     def _collect_files_modified(self, plan: TaskPlan) -> list[str]:
-        """Collect unique file paths modified across all subtasks."""
         seen = set()
         result = []
         for subtask in plan.subtasks:
@@ -261,7 +284,6 @@ class Orchestrator:
         return result
 
     def _collect_commands_run(self, plan: TaskPlan) -> list[str]:
-        """Collect commands run across all subtasks."""
         result = []
         for subtask in plan.subtasks:
             for trace in subtask.traces:

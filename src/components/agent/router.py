@@ -61,6 +61,12 @@ ROUTING_TABLE: dict[TaskType, ModelConfig] = {
     TaskType.REPAIR:      ModelConfig("llama-3.3-70b-versatile", "groq", 8192, 0.1, "repair single LLM call"),
     TaskType.CHECK:       ModelConfig("llama-3.1-8b-instant",    "groq", 2048, 0.0, "checker entry-point inference"),
     TaskType.SYNTHESISE:  ModelConfig("gemini-2.0-flash",        "gemini", 8192, 0.2, "synthesis"),
+    # Phase 0 additions
+    TaskType.RESEARCH:      ModelConfig("llama-3.1-8b-instant",    "groq", 2048, 0.1, "cheap query formulation"),
+    TaskType.KG_BUILD:      ModelConfig("gemini-2.0-flash",        "gemini", 4096, 0.1, "structured summarisation"),
+    TaskType.SECURITY_SCAN: ModelConfig("llama-3.3-70b-versatile", "groq", 4096, 0.0, "security analysis"),
+    TaskType.SYSTEM_INFO:   ModelConfig("llama-3.1-8b-instant",    "groq", 1024, 0.0, "light system info summarisation"),
+    TaskType.GIT_OPS:       ModelConfig("llama-3.1-8b-instant",    "groq", 1024, 0.1, "commit message generation"),
 }
 
 

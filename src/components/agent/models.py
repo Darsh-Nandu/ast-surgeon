@@ -31,6 +31,12 @@ class TaskType(str, Enum):
     SYNTHESISE   = "synthesise"
     REPAIR       = "repair"       # single-LLM repair call, no new SubAgents
     CHECK        = "check"        # checker agent task type
+    # Phase 0 additions
+    RESEARCH     = "research"     # web / knowledge retrieval query formulation
+    KG_BUILD     = "kg_build"     # knowledge-graph structured summarisation
+    SECURITY_SCAN = "security_scan"  # static security analysis
+    SYSTEM_INFO  = "system_info"  # lightweight system info summarisation
+    GIT_OPS      = "git_ops"      # commit message generation / git operations
 
 
 # Task types that produce runnable code and should be checked
@@ -54,6 +60,22 @@ class SubTaskStatus(str, Enum):
 class AgentMode(str, Enum):
     DIRECT   = "direct"
     PARALLEL = "parallel"
+
+
+class SubAgentRole(str, Enum):
+    """Role a SubAgent is assigned within the plan DAG."""
+    GENERAL        = "general"
+    FRONTEND       = "frontend"
+    BACKEND_LOGIC  = "backend_logic"
+    TEST           = "test"
+    DOCS           = "docs"
+
+
+class MainRoute(str, Enum):
+    """Top-level routing decision made by MainOrchestrator."""
+    GENERATE      = "generate"       # normal Planner → Orchestrator → … flow
+    RUN_TESTS     = "run_tests"      # skip planning, run check_pipeline directly
+    REPAIR_FILES  = "repair_files"   # skip planning, diagnose + repair named files
 
 
 # ─── Health / Sleep models ────────────────────────────────────────────────────
@@ -167,6 +189,7 @@ class SubTask:
     spawn_subagent: bool
     context_hint: str = ""
     max_steps: int = 10
+    role: SubAgentRole = SubAgentRole.GENERAL   # Phase 0: specialisation hint
 
     # Set during execution
     status: SubTaskStatus = SubTaskStatus.PENDING
@@ -239,6 +262,18 @@ class PipelineCheckResult:
     timestamp: float = field(default_factory=time.time)
 
 
+# ─── RepairRequest ────────────────────────────────────────────────────────────
+
+@dataclass
+class RepairRequest:
+    """Thin wrapper passed into RepairAgent (Phase 2) describing what to fix."""
+    source: str                                    # "static" | "pipeline"
+    static_result: Optional["StaticCheckResult"] = None
+    pipeline_result: Optional["PipelineCheckResult"] = None
+    attempt: int = 1
+    give_up: bool = False
+
+
 # ─── AgentResult ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -257,6 +292,12 @@ class AgentResult:
     sleep_mode: bool = False
     health_report: Optional[PipelineHealth] = None
     check_result: Optional["PipelineCheckResult"] = None   # set if checker ran
+    # Phase 0 additions
+    repair_attempts: int = 0
+    kg_updated: bool = False
+    security_findings: list[dict] = field(default_factory=list)
+    git_summary: Optional[dict] = None
+    route: Optional[MainRoute] = None   # which MainRoute was taken (observability)
 
     def step_summary(self) -> str:
         lines = [

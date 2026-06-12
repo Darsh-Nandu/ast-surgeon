@@ -27,6 +27,7 @@ from .models import AgentResult, AgentMode
 from .planner import Planner
 from .router import ModelRouter
 from .orchestrator import Orchestrator
+from .main_orchestrator import MainOrchestrator
 from .session_manager import SessionManager, SessionInfo
 from ..memory.coordinator import MemoryCoordinator
 
@@ -93,6 +94,16 @@ class AgentLoop:
             vector_store=vector_store,
             embed_pipeline=embed_pipeline,
             indexer=indexer,
+        )
+        # Phase 0B: MainOrchestrator sits between AgentLoop and Planner/Orchestrator.
+        # Agent instances (SystemInfoAgent, RepairAgent, etc.) are None until their
+        # respective phases land; MainOrchestrator degrades gracefully until then.
+        self._main_orchestrator = MainOrchestrator(
+            router=router,
+            planner=self._planner,
+            orchestrator=self._orchestrator,
+            indexer=indexer,
+            vector_store=vector_store,
         )
 
     # ─── Factories ────────────────────────────────────────────────────────────
@@ -293,17 +304,13 @@ class AgentLoop:
         # Layer 2 injection: give Planner episodic memory context
         episodic_context = self._memory.planner_context()
 
-        plan = self._planner.plan(
+        # Phase 0B: delegate to MainOrchestrator which routes to the correct flow.
+        # Previously this was: plan = self._planner.plan(...) + self._orchestrator.execute(...)
+        result = self._main_orchestrator.run(
             query=query,
-            codebase_summary=codebase_summary,
             conversation_history=self._session.history,
             episodic_context=episodic_context,
-        )
-        logger.info("Plan: %s", plan.summary())
-
-        result = self._orchestrator.execute(
-            plan=plan,
-            conversation_history=self._session.history,
+            codebase_summary=codebase_summary,
             memory_coordinator=self._memory,
         )
 

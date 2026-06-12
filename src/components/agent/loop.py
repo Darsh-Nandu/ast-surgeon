@@ -58,6 +58,7 @@ class AgentLoop:
         vector_store=None,
         embed_pipeline=None,
         indexer=None,
+        checker_enabled: bool = False,
     ):
         self._root = Path(project_root)
         self._router = router
@@ -68,11 +69,22 @@ class AgentLoop:
         self._session_manager = session_manager
 
         # Layer 1 + 2 Memory
+        # checker_enabled: from config or CLI flag; persisted in episodic facts
+        _checker_on = checker_enabled or (
+            session.session_dir.parent.parent  # .sovereign/
+            and False  # will be loaded from episodic facts after bootstrap
+        )
         self._memory = MemoryCoordinator(
             session_dir=session.session_dir,
             project_root=Path(project_root),
+            checker_enabled=checker_enabled,
         )
+        self._memory.set_router(router)
         self._memory.bootstrap()
+        # Restore checker toggle from episodic if it was set in a previous session
+        _saved = self._memory.episodic.project_facts.get("checker_enabled")
+        if _saved and _saved.value == "true" and not checker_enabled:
+            self._memory.enable_checker()
 
         self._planner = Planner(router)
         self._orchestrator = Orchestrator(
@@ -94,6 +106,7 @@ class AgentLoop:
         qdrant_host: str = "localhost",
         qdrant_port: int = 6333,
         embedding_provider: Optional[str] = None,
+        checker_enabled: bool = False,
     ) -> "AgentLoop":
         """Create a fresh session and return a wired AgentLoop."""
         project_root = Path(project_root)
@@ -109,6 +122,7 @@ class AgentLoop:
             qdrant_host=qdrant_host,
             qdrant_port=qdrant_port,
             embedding_provider=embedding_provider,
+            checker_enabled=checker_enabled,
         )
 
     @classmethod
@@ -121,6 +135,7 @@ class AgentLoop:
         qdrant_host: str = "localhost",
         qdrant_port: int = 6333,
         embedding_provider: Optional[str] = None,
+        checker_enabled: bool = False,
     ) -> "AgentLoop":
         """Resume an existing session by ID."""
         project_root = Path(project_root)
@@ -139,6 +154,7 @@ class AgentLoop:
             qdrant_host=qdrant_host,
             qdrant_port=qdrant_port,
             embedding_provider=embedding_provider,
+            checker_enabled=checker_enabled,
         )
 
     @classmethod
@@ -189,6 +205,7 @@ class AgentLoop:
         qdrant_host: str,
         qdrant_port: int,
         embedding_provider: Optional[str],
+        checker_enabled: bool = False,
     ) -> "AgentLoop":
         router = ModelRouter(
             groq_api_key=groq_api_key or os.environ.get("GROQ_API_KEY"),
@@ -262,6 +279,7 @@ class AgentLoop:
             vector_store=vector_store,
             embed_pipeline=embed_pipeline,
             indexer=indexer,
+            checker_enabled=checker_enabled,
         )
 
     # ─── Public API ───────────────────────────────────────────────────────────
@@ -329,6 +347,20 @@ class AgentLoop:
     @property
     def history(self) -> list[dict]:
         return list(self._session.history)
+
+    # ─── Checker toggle (callable from CLI / session slash commands) ──────────
+
+    def enable_checker(self) -> None:
+        """Turn checker ON. Persisted in episodic memory so --resume keeps it."""
+        self._memory.enable_checker()
+
+    def disable_checker(self) -> None:
+        """Turn checker OFF."""
+        self._memory.disable_checker()
+
+    @property
+    def checker_enabled(self) -> bool:
+        return self._memory.checker_enabled
 
     # ─── Internal ─────────────────────────────────────────────────────────────
 

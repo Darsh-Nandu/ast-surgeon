@@ -49,6 +49,7 @@ from .episodic_memory import EpisodicMemory
 
 if TYPE_CHECKING:
     from ..agent.models import SubTask, AgentResult
+    from ..agent.checker import CheckerAgent
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,12 @@ class MemoryCoordinator:
     via VectorStore + EmbeddingPipeline. This coordinator wraps layers 1 & 2.
     """
 
-    def __init__(self, session_dir: Path, project_root: Path):
+    def __init__(
+        self,
+        session_dir: Path,
+        project_root: Path,
+        checker_enabled: bool = False,
+    ):
         self._session_dir = session_dir
         self._project_root = project_root
 
@@ -72,10 +78,18 @@ class MemoryCoordinator:
         # Layer 1 — keyed by agent_id; each SubAgent gets its own instance
         self._working_memories: dict[str, WorkingMemory] = {}
 
+        # Router reference for CheckerAgent (injected via set_router)
+        self._router = None
+
+        # CheckerAgent — created lazily, controlled by toggle
+        self._checker_enabled = checker_enabled
+        self._checker: Optional["CheckerAgent"] = None
+
         logger.info(
-            "MemoryCoordinator: session_dir=%s, episodic=%s turns",
+            "MemoryCoordinator: session_dir=%s, episodic=%s turns, checker=%s",
             session_dir,
             len(self.episodic.turn_summaries),
+            "ON" if checker_enabled else "OFF",
         )
 
     # ─── Session bootstrap ────────────────────────────────────────────────────
@@ -90,6 +104,53 @@ class MemoryCoordinator:
         self.episodic.save()
         logger.info("MemoryCoordinator: bootstrap complete, %d facts detected",
                     len(self.episodic.project_facts))
+
+    # ─── Checker access + toggle ─────────────────────────────────────────────
+
+    @property
+    def checker(self) -> Optional["CheckerAgent"]:
+        """Lazy-create CheckerAgent on first access."""
+        if self._checker is None:
+            from ..agent.checker import CheckerAgent
+            from ..agent.router import ModelRouter
+            # Re-use the router from bootstrap — we can't import it at module
+            # level without a circular dep, so we grab it from the episodic facts.
+            # The actual router is injected via set_router() after construction.
+            self._checker = CheckerAgent(
+                project_root=self._project_root,
+                router=self._router,
+                cache_path=self._session_dir / "check_cache.json",
+                enabled=self._checker_enabled,
+            )
+        return self._checker
+
+    def set_router(self, router) -> None:
+        """Inject router so CheckerAgent can make LLM calls.
+        Call this right after MemoryCoordinator.__init__()."""
+        self._router = router
+
+    def enable_checker(self) -> None:
+        """Turn checker ON at runtime (e.g. from /checker on slash command)."""
+        self._checker_enabled = True
+        if self._checker is not None:
+            self._checker.enable()
+        # Persist preference so it survives resume
+        self.episodic.set_fact("checker_enabled", "true", source="user toggle")
+        self.episodic.save()
+        logger.info("MemoryCoordinator: checker ENABLED")
+
+    def disable_checker(self) -> None:
+        """Turn checker OFF at runtime (e.g. from /checker off slash command)."""
+        self._checker_enabled = False
+        if self._checker is not None:
+            self._checker.disable()
+        self.episodic.set_fact("checker_enabled", "false", source="user toggle")
+        self.episodic.save()
+        logger.info("MemoryCoordinator: checker DISABLED")
+
+    @property
+    def checker_enabled(self) -> bool:
+        return self._checker_enabled
 
     # ─── Layer 1: Working memory ──────────────────────────────────────────────
 

@@ -29,6 +29,18 @@ class TaskType(str, Enum):
     RUN          = "run"
     EXPLAIN      = "explain"
     SYNTHESISE   = "synthesise"
+    REPAIR       = "repair"       # single-LLM repair call, no new SubAgents
+    CHECK        = "check"        # checker agent task type
+
+
+# Task types that produce runnable code and should be checked
+CODE_TASK_TYPES = frozenset({
+    TaskType.CODE_GEN,
+    TaskType.CODE_EDIT,
+    TaskType.DEBUG,
+    TaskType.TEST_WRITE,
+    TaskType.REPAIR,
+})
 
 
 class SubTaskStatus(str, Enum):
@@ -198,6 +210,35 @@ class TaskPlan:
         return f"TaskPlan({self.mode.value}, {len(self.subtasks)} tasks, {done} done)"
 
 
+# ─── CheckResult ─────────────────────────────────────────────────────────────
+
+@dataclass
+class StaticCheckResult:
+    """Result of a fast per-file syntax/import check (Phase 1)."""
+    path: str
+    passed: bool
+    error: str = ""
+    check_type: str = "syntax"    # "syntax" | "import" | "lint"
+    cached: bool = False          # True if result came from cache (no re-run)
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class PipelineCheckResult:
+    """Result of a full pipeline execution check (Phase 2)."""
+    passed: bool
+    command_used: str             # the entry command inferred by LLM
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = 0
+    files_checked: list[str] = field(default_factory=list)
+    error_file: str = ""          # which file the error is in (LLM-diagnosed)
+    error_line: int = 0
+    repair_prompt: str = ""       # detailed repair prompt for RepairAgent
+    cached: bool = False          # True if result came from cache
+    timestamp: float = field(default_factory=time.time)
+
+
 # ─── AgentResult ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -215,6 +256,7 @@ class AgentResult:
     total_latency_ms: float = 0.0
     sleep_mode: bool = False
     health_report: Optional[PipelineHealth] = None
+    check_result: Optional["PipelineCheckResult"] = None   # set if checker ran
 
     def step_summary(self) -> str:
         lines = [

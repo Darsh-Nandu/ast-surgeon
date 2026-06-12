@@ -33,6 +33,8 @@ from .models import (
 from .router import ModelRouter
 from .subagent import SubAgent
 from .synthesiser import Synthesiser
+from .checker import CheckerAgent
+from .models import CODE_TASK_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ class Orchestrator:
         self._indexer = indexer          # optional live-reindex after writes
         self._synthesiser = Synthesiser(router)
         self._memory_coordinator = None  # set in execute()
+        self._checker: CheckerAgent | None = None   # set in execute() from coordinator
 
     # ─── Public ──────────────────────────────────────────────────────────────
 
@@ -71,10 +74,35 @@ class Orchestrator:
         logger.info("Orchestrator: %s", plan.summary())
         self._memory_coordinator = memory_coordinator  # passed to SubAgents
 
+        # Grab checker from coordinator if available
+        self._checker = (
+            memory_coordinator.checker
+            if memory_coordinator is not None and hasattr(memory_coordinator, "checker")
+            else None
+        )
+
         if plan.mode == AgentMode.DIRECT:
             all_traces = self._run_direct(plan, conversation_history)
         else:
             all_traces = self._run_parallel(plan, conversation_history)
+
+        # ── Phase 2: Pipeline execution check ────────────────────────────
+        check_result = None
+        if self._checker is not None and self._checker.enabled:
+            all_files_written = self._collect_all_files_written(plan)
+            if all_files_written:
+                turn_number = len(
+                    memory_coordinator.episodic.turn_summaries
+                ) if memory_coordinator else 0
+                check_result = self._checker.check_pipeline(
+                    all_files_written=all_files_written,
+                    memory_coordinator=memory_coordinator,
+                    turn_number=turn_number,
+                )
+                if check_result.cached:
+                    logger.info("Orchestrator: Phase 2 check CACHED (%s)", "PASS" if check_result.passed else "FAIL")
+                else:
+                    logger.info("Orchestrator: Phase 2 check %s", "PASS" if check_result.passed else "FAIL")
 
         # ── Aggregate health across all subtasks ──────────────────────────
         aggregate_health = self._aggregate_health(plan)
@@ -97,6 +125,7 @@ class Orchestrator:
         result.total_latency_ms = (time.monotonic() - t0) * 1000
         result.sleep_mode = aggregate_health.sleep_mode
         result.health_report = aggregate_health
+        result.check_result = check_result
 
         if aggregate_health.sleep_mode:
             logger.warning(
@@ -320,6 +349,16 @@ class Orchestrator:
                 task.status = SubTaskStatus.SKIPPED
                 logger.info("Skipped %s (dependency %s failed)", task.id, failed_id)
                 self._skip_dependents(plan, task.id)
+
+    def _collect_all_files_written(self, plan: TaskPlan) -> dict[str, str]:
+        """Gather {path: content} for ALL files written across all subtasks.
+        Used by Phase 2 checker so it sees the complete output of the turn."""
+        merged: dict[str, str] = {}
+        for t in plan.subtasks:
+            if t.task_type in CODE_TASK_TYPES:
+                fw = getattr(t, "files_written", None) or {}
+                merged.update(fw)
+        return merged
 
     def _collect_files_modified(self, plan: TaskPlan) -> list[str]:
         seen = set()

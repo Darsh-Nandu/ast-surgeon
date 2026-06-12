@@ -279,6 +279,8 @@ def chat(
     path: str = typer.Argument(".", help="Project directory"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Override LLM model"),
     resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume a previous session by ID"),
+    check: bool = typer.Option(False, "--check", "-c",
+        help="Enable CheckerAgent: runs code after each turn, auto-repairs failures."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
     """Start or resume an interactive chat session with the coding agent.
@@ -286,12 +288,16 @@ def chat(
     New session:
         sovereign chat
 
+    With code checking enabled:
+        sovereign chat --check
+
     Resume a previous session:
         sovereign chat --resume <session-id>
 
     The agent has access to your indexed codebase and can read, write,
     search, and run commands in your project.
     Each session gets its own isolated Qdrant vector collection.
+    Toggle checker at runtime with /checker on | /checker off.
     """
     _setup_logging(verbose)
     project_root = _find_project_root(Path(path))
@@ -315,6 +321,7 @@ def chat(
         config=config,
         session_id=resume,
         model=model,
+        checker_enabled=check or config.get("checker_enabled", False),
     )
     session.run_repl()
 

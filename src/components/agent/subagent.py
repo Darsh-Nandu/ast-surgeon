@@ -369,6 +369,24 @@ class SubAgent:
                 if path and not tool_error:
                     content_written = tool_args.get("content", "")
                     self._wm.record_file_write(path, content_written, operation=tool_name)
+                    # Phase 1: static check — fast, cached by content hash
+                    checker = (
+                        self._memory_coordinator.checker
+                        if self._memory_coordinator is not None
+                           and hasattr(self._memory_coordinator, "checker")
+                        else None
+                    )
+                    if checker is not None and checker.enabled:
+                        static = checker.check_static(path, content_written)
+                        if not static.passed and not static.cached:
+                            # Inject error back so LLM knows immediately
+                            self._wm.record_error(
+                                step=step_num,
+                                tool="static_check",
+                                message=f"Syntax error in {path}: {static.error[:200]}",
+                            )
+                            result_raw = (result_raw or "") + f"\n[STATIC CHECK FAILED] {static.error[:300]}"
+                            logger.warning("Phase 1 FAIL: %s — %s", path, static.error[:80])
             elif tool_name == "read_file":
                 path = tool_args.get("path", "")
                 if path and not tool_error:

@@ -38,14 +38,15 @@ from rich.text import Text
 console = Console()
 
 SLASH_COMMANDS = {
-    "/help":            "Show this help message",
-    "/status":          "Show index and session stats",
-    "/session":         "Show current session ID and info",
-    "/sessions":        "List all saved sessions for this project",
-    "/search <query>":  "Quick semantic search",
-    "/files":           "Show files modified this session",
-    "/clear":           "Clear conversation history (keeps session alive)",
-    "/exit":            "Exit (session saved automatically)",
+    "/help":              "Show this help message",
+    "/status":            "Show index and session stats",
+    "/session":           "Show current session ID and info",
+    "/sessions":          "List all saved sessions for this project",
+    "/search <query>":    "Quick semantic search",
+    "/files":             "Show files modified this session",
+    "/checker on|off":    "Toggle CheckerAgent (runs & verifies code after each turn)",
+    "/clear":             "Clear conversation history (keeps session alive)",
+    "/exit":              "Exit (session saved automatically)",
 }
 
 
@@ -63,10 +64,12 @@ class ChatSession:
         config: dict,
         session_id: Optional[str] = None,
         model: Optional[str] = None,
+        checker_enabled: bool = False,
     ):
         self._root = project_root
         self._config = config
         self._model = model
+        self._checker_enabled = checker_enabled
         self._session_start = time.time()
 
         from src.components.agent.loop import AgentLoop
@@ -78,6 +81,7 @@ class ChatSession:
                 qdrant_host=config.get("qdrant_host", "localhost"),
                 qdrant_port=config.get("qdrant_port", 6333),
                 embedding_provider=config.get("embedding_provider"),
+                checker_enabled=checker_enabled,
             )
             console.print(
                 f"[dim]Resumed session [cyan]{session_id[:8]}[/] "
@@ -89,6 +93,7 @@ class ChatSession:
                 qdrant_host=config.get("qdrant_host", "localhost"),
                 qdrant_port=config.get("qdrant_port", 6333),
                 embedding_provider=config.get("embedding_provider"),
+                checker_enabled=checker_enabled,
             )
             sid = self._agent_loop.session_id
             console.print(
@@ -153,6 +158,9 @@ class ChatSession:
 
         elif cmd == "/files":
             self._show_modified_files()
+
+        elif cmd == "/checker":
+            self._handle_checker_toggle(args)
 
         elif cmd == "/search":
             if not args:
@@ -235,6 +243,24 @@ class ChatSession:
             Panel(table, title=f"[bold]Sessions ({len(sessions)})[/]", border_style="dim")
         )
 
+    def _handle_checker_toggle(self, args: str) -> None:
+        """Handle /checker on | /checker off | /checker (show status)."""
+        arg = args.strip().lower()
+        if arg == "on":
+            self._agent_loop.enable_checker()
+            console.print(
+                "[green]✓ CheckerAgent ENABLED[/] — code will be run and verified after each turn."
+            )
+        elif arg == "off":
+            self._agent_loop.disable_checker()
+            console.print(
+                "[yellow]CheckerAgent DISABLED[/] — code will not be executed automatically."
+            )
+        else:
+            status = "[green]ON[/]" if self._agent_loop.checker_enabled else "[yellow]OFF[/]"
+            console.print(f"CheckerAgent is currently {status}.")
+            console.print("[dim]Use /checker on or /checker off to toggle.[/]")
+
     def _quick_search(self, query: str) -> None:
         store = self._agent_loop._store
         pipeline = self._agent_loop._pipeline
@@ -272,6 +298,8 @@ class ChatSession:
         table.add_row("[dim]Chunks[/]",           str(stats.get("chunks", 0)))
         table.add_row("[dim]Session turns[/]",    str(s.turn_count))
         table.add_row("[dim]Session duration[/]", f"{(time.time() - self._session_start):.0f}s")
+        checker_status = "[green]ON[/]" if self._agent_loop.checker_enabled else "[dim]off[/]"
+        table.add_row("[dim]CheckerAgent[/]", checker_status)
         console.print(Panel(table, title="Status", border_style="dim"))
 
     def _show_modified_files(self) -> None:
@@ -302,6 +330,14 @@ class ChatSession:
             )
         if result.sleep_mode:
             parts.append("[yellow]⚠ Pipeline entered sleep mode[/]")
+        if result.check_result is not None:
+            cr = result.check_result
+            if cr.cached:
+                parts.append(f"[dim]✓ Check: cached {'PASS' if cr.passed else 'FAIL'}[/]")
+            elif cr.passed:
+                parts.append(f"[green]✓ Check: PASSED[/] [dim]{cr.command_used[:50]}[/]")
+            else:
+                parts.append(f"[red]✗ Check: FAILED[/] — {cr.repair_prompt[:80]}")
         if not result.success and result.error:
             parts.append(f"[red]Error: {result.error[:80]}[/]")
         for part in parts:

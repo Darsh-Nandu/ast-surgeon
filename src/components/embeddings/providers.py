@@ -1,70 +1,82 @@
 """
-Embedding pipeline — provider abstraction + concrete implementations.
+Embedding provider abstraction + concrete implementations.
 
-Provider priority (configured via SOVEREIGN_EMBEDDING_PROVIDER env var):
-  1. "voyage"  — voyage-code-2 via Voyage AI API (best code recall)
-  2. "openai"  — text-embedding-3-large via OpenAI API (fallback)
-  3. "local"   — sentence-transformers all-MiniLM-L6-v2 (offline/free fallback)
+Supported providers:
+  ┌─────────────┬──────────────────────────────┬───────────┬──────────────────┐
+  │ Key         │ Model                        │ Dims      │ Best for         │
+  ├─────────────┼──────────────────────────────┼───────────┼──────────────────┤
+  │ voyage      │ voyage-code-2                │ 1536      │ Code (best)      │
+  │ openai      │ text-embedding-3-large       │ 1536      │ General, popular │
+  │ cohere      │ embed-english-v3.0           │ 1024      │ Great recall     │
+  │ gemini      │ text-embedding-004           │ 768       │ Google ecosystem │
+  │ mistral     │ mistral-embed                │ 1024      │ Fast + cheap     │
+  │ local       │ configurable (sentence-xfmr) │ varies    │ Offline / free   │
+  └─────────────┴──────────────────────────────┴───────────┴──────────────────┘
 
-DESIGN NOTE on batching:
-  Embedding APIs charge per token and have throughput limits. We always batch
-  chunks rather than embedding one at a time. The `embed_chunks` method accepts
-  a list and returns a parallel list of vectors. Callers must not call it in a
-  tight loop per-chunk.
+All providers implement the same interface. Switching providers is one line:
+    provider = get_provider("cohere")   # was "voyage"
 
-DESIGN NOTE on dimensionality:
-  voyage-code-2: 1536 dims
-  text-embedding-3-large: 3072 dims (we use 1536 via truncation param)
-  all-MiniLM-L6-v2: 384 dims
+DESIGN NOTE on dimensions:
+  Each provider exposes a `dimension` property returning its actual output size.
+  The VectorStore is initialised with `store.ensure_collection(provider.dimension)`.
+  No global EMBED_DIM constant, no zero-padding, no silent shape mismatches.
 
-  We normalise to 1536 across all providers so Qdrant collection config
-  never needs to change when you switch providers.
+DESIGN NOTE on asymmetric embeddings:
+  Several providers (Voyage, Cohere, Gemini) support separate document vs query
+  embeddings. We exploit this everywhere - chunks are embedded as documents,
+  search queries as queries. This measurably improves recall on code.
+
+DESIGN NOTE on env vars:
+  Provider selection: AST_SURGEON_EMBEDDING_PROVIDER
+  API keys follow each provider's conventional name (VOYAGE_API_KEY, etc.)
 """
 
 from __future__ import annotations
 
 import os
-import time
 from abc import ABC, abstractmethod
 from typing import Optional
+
 import httpx
 
 from ..chunker.models import CodeChunk
 
 
-EMBED_DIM = 1536   # canonical dimension across all providers
-
 # Abstract base
+
 class EmbeddingProvider(ABC):
-    """Interface all embedding providers must satisfy."""
+    """Interface every embedding provider must implement."""
 
     @abstractmethod
     def embed_chunks(self, chunks: list[CodeChunk]) -> list[list[float]]:
-        """
-        Return one embedding vector per chunk, in the same order.
-        """
+        """Return one embedding vector per chunk, in the same order."""
 
     @abstractmethod
     def embed_query(self, query: str) -> list[float]:
-        """Embed a query string for retrieval (asymmetric if provider supports it)."""
+        """Embed a search query (may use a different model head than embed_chunks)."""
 
     @property
+    @abstractmethod
     def dimension(self) -> int:
-        return EMBED_DIM
+        """Dimension of vectors this provider produces."""
+
 
 class EmbeddingError(RuntimeError):
-    """Raised when an embedding provider call fails unrecoverably."""
+    """Raised when an embedding API call fails unrecoverably after retries."""
 
-# Shared: chunk → text preparation
+
+# Shared text preparation
+
 def _chunk_to_text(chunk: CodeChunk) -> str:
-    """Prepare a chunk's text for embedding.
+    """
+    Prepare a chunk's text for embedding.
 
-    Prepends a short header so the model sees context like:
-      "python function Calculator.add\n<source>"
-    This improves retrieval for natural-language queries.
+    For code chunks, prepends a brief header:
+        "python function Calculator.add\n\ndef add(self, a, b): ..."
 
-    DESIGN NOTE: voyage-code-2 is trained on code with such headers, so this
-    helps. For prose chunks we skip the header since the content speaks for itself.
+    This improves retrieval for natural-language queries like "how does add work?"
+    because embedding models see the type and name alongside the body.
+    Prose chunks (TEXT_BLOCK) are embedded as-is.
     """
     if chunk.chunk_type.value == "text_block":
         return chunk.content
@@ -75,164 +87,381 @@ def _chunk_to_text(chunk: CodeChunk) -> str:
     return f"{header}\n\n{chunk.content}"
 
 
-# Voyage AI provider
-class VoyageProvider(EmbeddingProvider):
-    """Voyage AI voyage-code-2 embeddings.
+# Voyage AI
 
-    DESIGN NOTE: Voyage uses asymmetric embedding — documents and queries
-    use different input_type values. This measurably improves recall on code.
+class VoyageProvider(EmbeddingProvider):
+    """
+    Voyage AI - voyage-code-2 (best code retrieval, 1536 dims).
+
+    Env: VOYAGE_API_KEY
+    Docs: https://docs.voyageai.com/
     """
 
-    API_URL = "https://api.voyageai.com/v1/embeddings"
-    MODEL = "voyage-code-2"
+    API_URL    = "https://api.voyageai.com/v1/embeddings"
+    MODEL      = "voyage-code-2"
     BATCH_SIZE = 128
+    _DIMENSION = 1536
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self._api_key = api_key or os.environ.get("VOYAGE_API_KEY", "")
         if not self._api_key:
             raise EmbeddingError("VOYAGE_API_KEY not set")
+        self._model = model or self.MODEL
         self._client = httpx.Client(timeout=60.0)
 
+    @property
+    def dimension(self) -> int:
+        return self._DIMENSION
+
     def embed_chunks(self, chunks: list[CodeChunk]) -> list[list[float]]:
-        texts = [_chunk_to_text(c) for c in chunks]
-        return self._embed(texts, input_type="document")
+        return self._embed([_chunk_to_text(c) for c in chunks], input_type="document")
 
     def embed_query(self, query: str) -> list[float]:
         return self._embed([query], input_type="query")[0]
 
     def _embed(self, texts: list[str], input_type: str) -> list[list[float]]:
-        all_vectors: list[list[float]] = []
+        out = []
         for i in range(0, len(texts), self.BATCH_SIZE):
             batch = texts[i : i + self.BATCH_SIZE]
             resp = self._client.post(
                 self.API_URL,
                 headers={"Authorization": f"Bearer {self._api_key}"},
-                json={"model": self.MODEL, "input": batch, "input_type": input_type},
+                json={"model": self._model, "input": batch, "input_type": input_type},
             )
             if resp.status_code != 200:
-                raise EmbeddingError(
-                    f"Voyage API error {resp.status_code}: {resp.text[:200]}"
-                )
-            data = resp.json()
-            for item in sorted(data["data"], key=lambda x: x["index"]):
-                all_vectors.append(item["embedding"])
-        return all_vectors
+                raise EmbeddingError(f"Voyage API {resp.status_code}: {resp.text[:200]}")
+            for item in sorted(resp.json()["data"], key=lambda x: x["index"]):
+                out.append(item["embedding"])
+        return out
 
 
-# OpenAI provider (fallback)
+# OpenAI
+
 class OpenAIProvider(EmbeddingProvider):
-    """OpenAI text-embedding-3-large with dimension truncation to 1536."""
+    """
+    OpenAI text-embedding-3-large (1536 dims via server-side truncation).
 
-    API_URL = "https://api.openai.com/v1/embeddings"
-    MODEL = "text-embedding-3-large"
+    Env: OPENAI_API_KEY
+    Docs: https://platform.openai.com/docs/guides/embeddings
+    """
+
+    API_URL    = "https://api.openai.com/v1/embeddings"
+    MODEL      = "text-embedding-3-large"
     BATCH_SIZE = 100
+    _DIMENSION = 1536
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         if not self._api_key:
             raise EmbeddingError("OPENAI_API_KEY not set")
+        self._model = model or self.MODEL
         self._client = httpx.Client(timeout=60.0)
 
+    @property
+    def dimension(self) -> int:
+        return self._DIMENSION
+
     def embed_chunks(self, chunks: list[CodeChunk]) -> list[list[float]]:
-        texts = [_chunk_to_text(c) for c in chunks]
-        return self._embed(texts)
+        return self._embed([_chunk_to_text(c) for c in chunks])
 
     def embed_query(self, query: str) -> list[float]:
         return self._embed([query])[0]
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
-        all_vectors: list[list[float]] = []
+        out = []
         for i in range(0, len(texts), self.BATCH_SIZE):
             batch = texts[i : i + self.BATCH_SIZE]
             resp = self._client.post(
                 self.API_URL,
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json={
-                    "model": self.MODEL,
+                    "model": self._model,
                     "input": batch,
-                    "dimensions": EMBED_DIM,  # truncate to 1536
+                    "dimensions": self._DIMENSION,
                     "encoding_format": "float",
                 },
             )
             if resp.status_code != 200:
-                raise EmbeddingError(
-                    f"OpenAI API error {resp.status_code}: {resp.text[:200]}"
-                )
-            data = resp.json()
-            for item in sorted(data["data"], key=lambda x: x["index"]):
-                all_vectors.append(item["embedding"])
-        return all_vectors
+                raise EmbeddingError(f"OpenAI API {resp.status_code}: {resp.text[:200]}")
+            for item in sorted(resp.json()["data"], key=lambda x: x["index"]):
+                out.append(item["embedding"])
+        return out
 
 
-# Local provider — sentence-transformers (no API key required)
-class LocalProvider(EmbeddingProvider):
-    """Local sentence-transformers embedding — zero cost, works offline.
+# Cohere
 
-    DESIGN NOTE on dimension mismatch:
-      all-MiniLM-L6-v2 produces 384-dim vectors. We zero-pad to 1536 so the
-      Qdrant collection shape stays consistent. Padding hurts recall slightly
-      but keeps the architecture uniform. In prod, switch to voyage-code-2.
+class CohereProvider(EmbeddingProvider):
+    """
+    Cohere embed-english-v3.0 (1024 dims, excellent code + text retrieval).
+
+    Env: COHERE_API_KEY
+    Docs: https://docs.cohere.com/reference/embed
     """
 
-    MODEL_NAME = "all-MiniLM-L6-v2"
+    API_URL    = "https://api.cohere.ai/v1/embed"
+    MODEL      = "embed-english-v3.0"
+    BATCH_SIZE = 96   # Cohere max is 96 texts per call
+    _DIMENSION = 1024
 
-    def __init__(self):
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+        self._api_key = api_key or os.environ.get("COHERE_API_KEY", "")
+        if not self._api_key:
+            raise EmbeddingError("COHERE_API_KEY not set")
+        self._model = model or self.MODEL
+        self._client = httpx.Client(timeout=60.0)
+
+    @property
+    def dimension(self) -> int:
+        return self._DIMENSION
+
+    def embed_chunks(self, chunks: list[CodeChunk]) -> list[list[float]]:
+        return self._embed([_chunk_to_text(c) for c in chunks], input_type="search_document")
+
+    def embed_query(self, query: str) -> list[float]:
+        return self._embed([query], input_type="search_query")[0]
+
+    def _embed(self, texts: list[str], input_type: str) -> list[list[float]]:
+        out = []
+        for i in range(0, len(texts), self.BATCH_SIZE):
+            batch = texts[i : i + self.BATCH_SIZE]
+            resp = self._client.post(
+                self.API_URL,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self._model,
+                    "texts": batch,
+                    "input_type": input_type,
+                    "embedding_types": ["float"],
+                },
+            )
+            if resp.status_code != 200:
+                raise EmbeddingError(f"Cohere API {resp.status_code}: {resp.text[:200]}")
+            data = resp.json()
+            # v2 response: embeddings.float is a list of lists
+            embeddings = data.get("embeddings", {})
+            vecs = embeddings.get("float", embeddings) if isinstance(embeddings, dict) else embeddings
+            out.extend(vecs)
+        return out
+
+
+# Google Gemini
+
+class GeminiProvider(EmbeddingProvider):
+    """
+    Google Gemini text-embedding-004 (768 dims, great general + code recall).
+
+    Env: GEMINI_API_KEY  (get one free at https://aistudio.google.com)
+    Docs: https://ai.google.dev/api/embeddings
+    """
+
+    API_BASE   = "https://generativelanguage.googleapis.com/v1beta"
+    MODEL      = "text-embedding-004"
+    BATCH_SIZE = 100  # Gemini batchEmbedContents max
+    _DIMENSION = 768
+
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+        self._api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
+        if not self._api_key:
+            raise EmbeddingError("GEMINI_API_KEY not set")
+        self._model = model or self.MODEL
+        self._client = httpx.Client(timeout=60.0)
+
+    @property
+    def dimension(self) -> int:
+        return self._DIMENSION
+
+    def embed_chunks(self, chunks: list[CodeChunk]) -> list[list[float]]:
+        return self._embed([_chunk_to_text(c) for c in chunks], task="RETRIEVAL_DOCUMENT")
+
+    def embed_query(self, query: str) -> list[float]:
+        return self._embed([query], task="RETRIEVAL_QUERY")[0]
+
+    def _embed(self, texts: list[str], task: str) -> list[list[float]]:
+        out = []
+        url = f"{self.API_BASE}/models/{self._model}:batchEmbedContents?key={self._api_key}"
+
+        for i in range(0, len(texts), self.BATCH_SIZE):
+            batch = texts[i : i + self.BATCH_SIZE]
+            requests = [
+                {
+                    "model": f"models/{self._model}",
+                    "content": {"parts": [{"text": t}]},
+                    "taskType": task,
+                }
+                for t in batch
+            ]
+            resp = self._client.post(url, json={"requests": requests})
+            if resp.status_code != 200:
+                raise EmbeddingError(f"Gemini API {resp.status_code}: {resp.text[:200]}")
+            for item in resp.json().get("embeddings", []):
+                out.append(item["values"])
+        return out
+
+
+# Mistral
+
+class MistralProvider(EmbeddingProvider):
+    """
+    Mistral AI mistral-embed (1024 dims, fast and cost-effective).
+
+    Env: MISTRAL_API_KEY
+    Docs: https://docs.mistral.ai/api/#tag/embeddings
+    """
+
+    API_URL    = "https://api.mistral.ai/v1/embeddings"
+    MODEL      = "mistral-embed"
+    BATCH_SIZE = 512  # Mistral handles large batches well
+    _DIMENSION = 1024
+
+    def __init__(self, api_key: Optional[str] = None):
+        self._api_key = api_key or os.environ.get("MISTRAL_API_KEY", "")
+        if not self._api_key:
+            raise EmbeddingError("MISTRAL_API_KEY not set")
+        self._client = httpx.Client(timeout=60.0)
+
+    @property
+    def dimension(self) -> int:
+        return self._DIMENSION
+
+    def embed_chunks(self, chunks: list[CodeChunk]) -> list[list[float]]:
+        return self._embed([_chunk_to_text(c) for c in chunks])
+
+    def embed_query(self, query: str) -> list[float]:
+        return self._embed([query])[0]
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        out = []
+        for i in range(0, len(texts), self.BATCH_SIZE):
+            batch = texts[i : i + self.BATCH_SIZE]
+            resp = self._client.post(
+                self.API_URL,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"model": self.MODEL, "input": batch},
+            )
+            if resp.status_code != 200:
+                raise EmbeddingError(f"Mistral API {resp.status_code}: {resp.text[:200]}")
+            for item in sorted(resp.json()["data"], key=lambda x: x["index"]):
+                out.append(item["embedding"])
+        return out
+
+
+# Local (sentence-transformers)
+
+class LocalProvider(EmbeddingProvider):
+    """
+    Local sentence-transformers - zero API cost, works fully offline.
+
+    Install: pip install "ast-surgeon[local-embed]"
+
+    Default model: all-MiniLM-L6-v2  (384 dims, fast)
+    Better models:
+        "all-mpnet-base-v2"               - 768 dims, higher quality
+        "BAAI/bge-m3"                     - 1024 dims, multilingual
+        "nomic-ai/nomic-embed-text-v1"    - 768 dims, great for code
+
+    DESIGN NOTE on dimensions:
+        Each sentence-transformers model has its own dimension.
+        We read it from the model at init time - no zero-padding.
+        This means switching models requires a full re-index (different dims).
+    """
+
+    DEFAULT_MODEL = "all-MiniLM-L6-v2"
+
+    def __init__(self, model_name: Optional[str] = None):
         try:
             from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(self.MODEL_NAME)
         except ImportError:
             raise EmbeddingError(
-                "sentence-transformers not installed. "
-                "Run: pip install sentence-transformers"
+                "sentence-transformers not installed.\n"
+                "Run: pip install 'ast-surgeon[local-embed]'"
             )
+        self._model_name = model_name or os.environ.get(
+            "AST_SURGEON_LOCAL_MODEL", self.DEFAULT_MODEL
+        )
+        self._model = SentenceTransformer(self._model_name)
+        self._dim = self._model.get_sentence_embedding_dimension()
+
+    @property
+    def dimension(self) -> int:
+        return self._dim
 
     def embed_chunks(self, chunks: list[CodeChunk]) -> list[list[float]]:
         texts = [_chunk_to_text(c) for c in chunks]
-        vecs = self._model.encode(texts, normalize_embeddings=True).tolist()
-        return [self._pad(v) for v in vecs]
+        return self._model.encode(texts, normalize_embeddings=True).tolist()
 
     def embed_query(self, query: str) -> list[float]:
-        vec = self._model.encode([query], normalize_embeddings=True)[0].tolist()
-        return self._pad(vec)
-
-    @staticmethod
-    def _pad(vec: list[float]) -> list[float]:
-        """Zero-pad to EMBED_DIM."""
-        if len(vec) >= EMBED_DIM:
-            return vec[:EMBED_DIM]
-        return vec + [0.0] * (EMBED_DIM - len(vec))
+        return self._model.encode([query], normalize_embeddings=True)[0].tolist()
 
 
 # Factory
-def get_provider(name: Optional[str] = None) -> EmbeddingProvider:
-    """Instantiate the configured embedding provider.
+
+_PROVIDERS = {
+    "voyage":   VoyageProvider,
+    "openai":   OpenAIProvider,
+    "cohere":   CohereProvider,
+    "gemini":   GeminiProvider,
+    "mistral":  MistralProvider,
+    "local":    LocalProvider,
+}
+
+_AUTO_ORDER = [
+    ("voyage",  "VOYAGE_API_KEY"),
+    ("openai",  "OPENAI_API_KEY"),
+    ("cohere",  "COHERE_API_KEY"),
+    ("gemini",  "GEMINI_API_KEY"),
+    ("mistral", "MISTRAL_API_KEY"),
+]
+
+
+def get_provider(name: Optional[str] = None, **kwargs) -> EmbeddingProvider:
+    """
+    Build an EmbeddingProvider by name.
 
     Resolution order:
       1. `name` argument
-      2. SOVEREIGN_EMBEDDING_PROVIDER environment variable
-      3. Auto-detect: try voyage → openai → local
+      2. AST_SURGEON_EMBEDDING_PROVIDER environment variable
+      3. Auto-detect: first provider whose API key env var is set
+      4. LocalProvider (offline fallback - always works)
 
-    Args - name: "voyage" | "openai" | "local" | None
+    Args:
+        name:     "voyage" | "openai" | "cohere" | "gemini" | "mistral" | "local"
+        **kwargs: Passed to the provider constructor (e.g. api_key=, model=).
+
+    Examples:
+        get_provider()                      # auto-detect
+        get_provider("cohere")              # explicit
+        get_provider("local", model_name="BAAI/bge-m3")
+        get_provider("openai", model="text-embedding-3-small")
     """
-    chosen = name or os.environ.get("SOVEREIGN_EMBEDDING_PROVIDER", "auto")
+    chosen = name or os.environ.get("AST_SURGEON_EMBEDDING_PROVIDER", "auto")
 
-    if chosen == "voyage":
-        return VoyageProvider()
-    if chosen == "openai":
-        return OpenAIProvider()
-    if chosen == "local":
-        return LocalProvider()
-    if chosen == "auto":
-        # Try each in priority order, fall back gracefully
-        for Provider, env_key in [
-            (VoyageProvider, "VOYAGE_API_KEY"),
-            (OpenAIProvider, "OPENAI_API_KEY"),
-        ]:
-            if os.environ.get(env_key):
-                try:
-                    return Provider()
-                except EmbeddingError:
-                    continue
-        return LocalProvider()
+    if chosen != "auto":
+        cls = _PROVIDERS.get(chosen.lower())
+        if cls is None:
+            raise EmbeddingError(
+                f"Unknown provider: {chosen!r}. "
+                f"Choose from: {list(_PROVIDERS)}"
+            )
+        return cls(**kwargs)
 
-    raise EmbeddingError(f"Unknown provider: {chosen!r}")
+    # Auto mode: try each provider in priority order
+    for provider_name, env_key in _AUTO_ORDER:
+        if os.environ.get(env_key):
+            try:
+                return _PROVIDERS[provider_name](**kwargs)
+            except EmbeddingError:
+                continue
+
+    # Final fallback: local model (always available if sentence-transformers installed)
+    return LocalProvider(**kwargs)
+
+
+def list_providers() -> list[str]:
+    """Return the names of all supported embedding providers."""
+    return list(_PROVIDERS.keys())

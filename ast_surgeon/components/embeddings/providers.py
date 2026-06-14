@@ -384,8 +384,13 @@ class LocalProvider(EmbeddingProvider):
         self._model_name = model_name or os.environ.get(
             "AST_SURGEON_LOCAL_MODEL", self.DEFAULT_MODEL
         )
-        self._model = SentenceTransformer(self._model_name)
-        self._dim = self._model.get_sentence_embedding_dimension()
+        try:
+            self._model = SentenceTransformer(self._model_name)
+        except Exception as exc:
+            raise EmbeddingError(
+                f"Failed to load local embedding model {self._model_name!r}: {exc}"
+            ) from exc
+        self._dim = self._model.get_embedding_dimension()
 
     @property
     def dimension(self) -> int:

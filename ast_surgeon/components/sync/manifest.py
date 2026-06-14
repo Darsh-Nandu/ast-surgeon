@@ -13,7 +13,7 @@ WHY atomic writes (write-then-rename):
   near-atomic on Windows (same drive).
 
 Manifest file location:
-  <project_root>/.sovereign/manifest.json
+  <project_root>/.ast-surgeon/manifest.json
   Hidden dot-folder so it doesn't clutter the project tree.
 """
 
@@ -30,7 +30,7 @@ from ..chunker.models import ChunkManifest, ChunkRecord, ChunkType
 
 logger = logging.getLogger(__name__)
 
-SOVEREIGN_DIR = ".sovereign"
+AST_SURGEON_DIR = ".ast-surgeon"
 MANIFEST_FILE = "manifest.json"
 
 
@@ -47,12 +47,12 @@ class ManifestStore:
 
     def __init__(self, project_root: str | Path, manifest_path: str | Path | None = None):
         self._root = Path(project_root).resolve()
-        self._sovereign_dir = self._root / SOVEREIGN_DIR
+        self._ast_surgeon_dir = self._root / AST_SURGEON_DIR    
         if manifest_path is not None:
             # Allow callers to override the manifest location (e.g. per-session path)
             self._manifest_path = Path(manifest_path)
         else:
-            self._manifest_path = self._sovereign_dir / MANIFEST_FILE
+            self._manifest_path = self._ast_surgeon_dir / MANIFEST_FILE
 
 
     # Public API
@@ -82,15 +82,15 @@ class ManifestStore:
     def save(self, manifest: ChunkManifest) -> None:
         """Atomically write the manifest to disk.
 
-        Creates .sovereign/ if it doesn't exist.
+        Creates .ast-surgeon/ if it doesn't exist.
         """
-        self._sovereign_dir.mkdir(parents=True, exist_ok=True)
+        self._ast_surgeon_dir.mkdir(parents=True, exist_ok=True)
         data = self._serialise(manifest)
         serialised = json.dumps(data, indent=2)
 
         # Atomic write: temp file in same directory, then rename
         tmp_fd, tmp_path = tempfile.mkstemp(
-            dir=self._sovereign_dir, suffix=".tmp", prefix="manifest_"
+            dir=self._ast_surgeon_dir, suffix=".tmp", prefix="manifest_"
         )
         try:
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:

@@ -54,7 +54,7 @@ DEBOUNCE_SECONDS = 0.3    # collapse rapid multi-save bursts into one reindex
 
 # Event handler
 
-class _SovereignEventHandler(FileSystemEventHandler):
+class _AstSurgeonEventHandler(FileSystemEventHandler):
     """Watchdog event handler — debounces events and dispatches to Indexer.
 
     DESIGN NOTE on debouncing:
@@ -175,7 +175,7 @@ class FileWatcher:
                           to a CLI spinner or SSE stream.
         """
         self._root = Path(project_root).resolve()
-        self._handler = _SovereignEventHandler(
+        self._handler = _AstSurgeonEventHandler(
             indexer=indexer,
             project_root=self._root,
             on_indexed=on_indexed,

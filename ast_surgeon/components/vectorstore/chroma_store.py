@@ -74,7 +74,13 @@ class ChromaStore(VectorStore):
 
     @classmethod
     def in_memory(cls, collection: str = COLLECTION_NAME) -> "ChromaStore":
-        """Ephemeral in-memory ChromaDB. Perfect for tests."""
+        """
+        Ephemeral in-memory ChromaDB. Perfect for tests and small projects.
+
+        Each call gets its own isolated database — chromadb's EphemeralClient
+        shares a default database across instances in the same process, which
+        would otherwise leak collections between unrelated stores/tests.
+        """
         try:
             import chromadb
         except ImportError:
@@ -82,7 +88,11 @@ class ChromaStore(VectorStore):
                 "chromadb is not installed.\n"
                 "Run: pip install 'ast-surgeon[chroma]'"
             )
+        import uuid
         client = chromadb.EphemeralClient()
+        db_name = f"ast-surgeon-{uuid.uuid4().hex}"
+        client._admin_client.create_database(name=db_name, tenant=client.tenant)
+        client.set_database(db_name)
         return cls(client, collection)
 
     @classmethod
@@ -202,7 +212,7 @@ class ChromaStore(VectorStore):
         for vid, dist, meta in zip(ids, distances, metadatas):
             # Cosine distance ∈ [0,1] in ChromaDB → similarity = 1 - dist
             score = max(0.0, 1.0 - dist)
-            chunk = payload_to_chunk(meta, vid)
+            chunk = payload_to_chunk(_desanitise_metadata(meta), vid)
             hits.append(SearchResult(vector_id=vid, score=score, chunk=chunk))
 
         return hits
@@ -213,10 +223,18 @@ class ChromaStore(VectorStore):
 
 # Helpers
 
+# Payload fields that are list[str] in CodeChunk and get flattened to a
+# comma-joined string for ChromaDB storage. Must be kept in sync with
+# CodeChunk's list-typed fields (decorators, calls).
+_LIST_FIELDS = ("decorators", "calls")
+
+
 def _sanitise_metadata(payload: dict) -> dict:
     """
     ChromaDB only accepts str / int / float / bool metadata values.
     Convert lists to comma-joined strings, None to empty string.
+
+    See _desanitise_metadata() for the inverse operation applied on read.
     """
     out = {}
     for k, v in payload.items():
@@ -228,6 +246,27 @@ def _sanitise_metadata(payload: dict) -> dict:
             out[k] = v
         else:
             out[k] = str(v)
+    return out
+
+
+def _desanitise_metadata(meta: dict) -> dict:
+    """
+    Inverse of _sanitise_metadata() for fields known to be list[str] on
+    CodeChunk (decorators, calls). Splits comma-joined strings back into
+    lists; empty strings become empty lists.
+    """
+    out = dict(meta)
+    for field_name in _LIST_FIELDS:
+        raw = out.get(field_name, "")
+        if isinstance(raw, str):
+            out[field_name] = [s.strip() for s in raw.split(",") if s.strip()]
+    # docstring was stored as "" for None - restore None for round-trip fidelity
+    if out.get("docstring") == "":
+        out["docstring"] = None
+    if out.get("parent") == "":
+        out["parent"] = None
+    if out.get("name") == "":
+        out["name"] = None
     return out
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from src.components.tools.file_tools import (
+from ast_surgeon.components.tools.file_tools import (
     ReadFileTool, WriteFileTool, EditFileTool,
     ListDirTool, SearchFilesTool, RunCommandTool,
     ToolRegistry,

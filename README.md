@@ -1,8 +1,6 @@
 <div align="center">
 
-<h1>🔬 ast-surgeon</h1>
-
-<p><strong>AST-based code chunking, embedding, and semantic search for codebases.</strong></p>
+<img src="./banner.svg" alt="ast-surgeon" width="100%"/>
 
 <p>
   <a href="https://pypi.org/project/ast-surgeon"><img src="https://img.shields.io/pypi/v/ast-surgeon?style=flat-square&color=7c5cbf&label=pypi" alt="PyPI"></a>
